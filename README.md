@@ -15,20 +15,21 @@ Telegram  ──poll──▶  bridge  ──▶  prompts, /commands, keyboard t
 ## Install
 
 ```bash
-pi install npm:@sonic240612/pi-telegram
-
-# straight from GitHub, no npm round trip
 pi install git:github.com/sonic240612/pi-telegram
 
 # or a local checkout, while developing
 pi install /path/to/pi-telegram
 ```
 
-Use the **scoped** name: plain `pi-telegram` on npm is somebody else's package. If you installed that
-one earlier, `pi remove npm:pi-telegram` first — two bridges on one bot token fight each other.
+Use the **scoped** name if you install from npm: plain `pi-telegram` there is somebody else's package.
+`package.json` is already set up for `@sonic240612/pi-telegram`, so once it is published
+`pi install npm:@sonic240612/pi-telegram` works too. If you installed the unscoped one earlier,
+`pi remove npm:pi-telegram` first — two bridges on one bot token fight each other.
 
 The extension entry point is `index.ts` (declared in `package.json` under `pi.extensions`). After
 installing, restart pi (or run `/reload` in an already running pi).
+
+Updates: `pi update --extensions` re-syncs a git install, then restart pi (or `/reload`).
 
 ## Setup
 
