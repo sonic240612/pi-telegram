@@ -1,0 +1,56 @@
+{
+	"name": "@sonic240612/pi-telegram",
+	"version": "0.1.0",
+	"description": "Drive a running Pi agent from Telegram: mirrored transcript, pi slash commands, inline keyboards.",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"extension",
+		"telegram",
+		"bot"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/sonic240612/pi-telegram.git"
+	},
+	"bugs": {
+		"url": "https://github.com/sonic240612/pi-telegram/issues"
+	},
+	"homepage": "https://github.com/sonic240612/pi-telegram#readme",
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"files": [
+		"index.ts",
+		"src",
+		"README.md"
+	],
+	"scripts": {
+		"check": "tsc -p tsconfig.json",
+		"typecheck": "tsc -p tsconfig.json",
+		"smoke": "node --experimental-strip-types scripts/smoke.ts",
+		"live": "node --experimental-strip-types scripts/live-check.ts",
+		"probe": "node --experimental-strip-types scripts/debug-session-ops.ts",
+		"test": "npm run typecheck && npm run smoke"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.5.1",
+		"@types/node": "^26.6.6",
+		"typebox": "^1.4.6",
+		"typescript": "^7.0.2"
+	}
+}
