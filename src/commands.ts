@@ -7,7 +7,7 @@
  * template commands are passed straight through with `expandPromptTemplates`.
  */
 import type { CallbackActionKind, CallbackEntry, CallbackResult, Hub, ListSpec, SendOptions } from "./hub.ts";
-import { escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, tgDebug, truncate } from "./format.ts";
+import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, tgDebug, truncate } from "./format.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface CommandInvocation {
@@ -183,7 +183,7 @@ export class CommandLayer {
 			["모델·도구", "/model [이름·검색어] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<이름>]"],
 			["실행 제어", "/abort · /steer <메시지> · /queue <메시지> · /bash <셸 명령>"],
 			["상태·표시", "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu"],
+			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact"],
 		];
 		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
 		const notes = [
@@ -318,7 +318,7 @@ export class CommandLayer {
 			await this.say(chatId, "✅ 새 세션이 열렸어요.");
 		} catch (error) {
 			this.hub.clearPendingNotice(notice);
-			await this.quietSay(chatId, `⚠️ 새 세션 실패: ${escapeHtml(errorMessage(error))}`);
+			await this.quietSay(chatId, `⚠️ 새 세션 실패: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
@@ -359,7 +359,7 @@ export class CommandLayer {
 			const active = tools.filter((tool) => tool.active).map((tool) => tool.name);
 			const next = target.active ? active.filter((name) => name !== target.name) : [...active, target.name];
 			this.hub.setActiveTools(next);
-			await this.say(chatId, `🔧 ${target.name} ${target.active ? "off" : "on"} · active ${next.length}/${tools.length}`);
+			await this.say(chatId, `🔧 ${inlineCode(target.name)} ${target.active ? "off" : "on"} · active ${next.length}/${tools.length}`);
 			return;
 		}
 		await this.renderList(chatId, { list: "tools", args: "", page: 0 });
@@ -393,7 +393,10 @@ export class CommandLayer {
 		}
 		await this.say(chatId, `💻 ${inlineCode(truncate(command, 200))}`);
 		const result = await this.hub.runShell(command, 120_000);
-		const body = [result.stdout, result.stderr].filter(Boolean).join("\n").replace(/\s+$/g, "");
+		let body = [result.stdout, result.stderr].filter(Boolean).join("\n").replace(/\s+$/g, "");
+		// Commands like `curl -H "Authorization: Bearer …"` echo credentials into the log. The terminal
+		// keeps them; the Telegram copy of this run is scrubbed unless the chat opted out.
+		if (this.hub.cfg.redactBash) body = redactSecrets(body);
 		const head = `${result.code === 0 ? "✅" : "❌"} exit ${result.code}${result.truncated ? " · <i>truncated by pi</i>" : ""}${result.killed ? " · <i>killed</i>" : ""}`;
 		if (!body.trim()) {
 			await this.say(chatId, head);
@@ -419,9 +422,12 @@ export class CommandLayer {
 			const { readFileSync } = await import("node:fs");
 			const data = Uint8Array.from(readFileSync(path));
 			const name = path.split(/[\\/]/).pop() ?? "session.jsonl";
-			await this.hub.sendFile(chatId, data, name, `📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}`);
+			// The transcript is a second copy of everything pi handled, tool output included.
+			const hits = credentialHits(Buffer.from(data).toString("utf8"));
+			const caption = `📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}${hits ? ` · ⚠️ credential처럼 보이는 문자열 ${hits}개` : ""}`;
+			await this.hub.sendFile(chatId, data, name, caption);
 		} catch (error) {
-			await this.say(chatId, `⚠️ export 실패: ${escapeHtml(errorMessage(error))}`);
+			await this.say(chatId, `⚠️ export 실패: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
@@ -450,6 +456,40 @@ export class CommandLayer {
 		await this.say(chatId, `✍️ 실시간 초안 ${this.hub.cfg.streaming ? "on" : "off"}`);
 	}
 
+	/** How hard the bridge scrubs credentials from the copies it makes for Telegram. */
+	private async redact(chatId: number, args: string): Promise<void> {
+		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+		let scope: "bash" | "transcript" = "bash";
+		if (parts[0] === "transcript") {
+			scope = "transcript";
+			parts.shift();
+		} else if (parts[0] === "bash") {
+			parts.shift();
+		}
+		const flag = parts[0];
+		if (flag === "on" || flag === "1" || flag === "true" || flag === "off" || flag === "0" || flag === "false") {
+			const value = flag === "on" || flag === "1" || flag === "true";
+			if (scope === "bash") this.hub.cfg.redactBash = value;
+			else this.hub.cfg.redactTranscript = value;
+			this.hub.save();
+		} else if (flag) {
+			await this.say(chatId, `⚠️ usage: ${inlineCode("/tg redact on|off")} 또는 ${inlineCode("/tg redact transcript on|off")}`);
+			return;
+		}
+		await this.say(
+			chatId,
+			[
+				"<b>credential 지우기</b>",
+				`· /bash 로그: ${this.hub.cfg.redactBash ? "on" : "off"}`,
+				`· 미러링되는 transcript: ${this.hub.cfg.redactTranscript ? "on" : "off"}`,
+				"",
+				"<i>pi/provider 에러와 브리지 알림은 항상 지워요 — provider가 요청에 쓰인 key를 에러문에 그대로 옮겨 적기 때문이에요. 보낸 key는 지워지지만 메지시 본문은 그대로 남아요.</i>",
+				`usage: ${inlineCode("/tg redact on|off")} · ${inlineCode("/tg redact transcript on|off")}`,
+			].join("\n"),
+			{ markdown: false },
+		);
+	}
+
 	private async reload(chatId: number): Promise<void> {
 		await this.say(chatId, "♻️ pi 리소스 reload 중…");
 		try {
@@ -458,7 +498,7 @@ export class CommandLayer {
 			});
 			await this.say(chatId, "✅ reload 완료 (브지도 다시 시작됩니다)");
 		} catch (error) {
-			await this.say(chatId, `⚠️ reload 실패: ${escapeHtml(errorMessage(error))}`);
+			await this.say(chatId, `⚠️ reload 실패: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
@@ -489,13 +529,15 @@ export class CommandLayer {
 				return this.verbose(chatId, rest);
 			case "stream":
 				return this.stream(chatId, rest);
+			case "redact":
+				return this.redact(chatId, rest);
 			case "stats":
 			case "latency":
 				return this.tgStats(chatId);
 			case "menu":
 				return this.tgMenu(chatId);
 			default:
-				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu")}`);
+				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact")}`);
 		}
 	}
 
@@ -747,7 +789,7 @@ export class CommandLayer {
 					await this.say(chatId, "✅ 세션 전환 요청이 처리됐어요.");
 				} catch (error) {
 					this.hub.clearPendingNotice(notice);
-					await this.quietSay(chatId, `⚠️ resume 실패: ${escapeHtml(errorMessage(error))}`);
+					await this.quietSay(chatId, `⚠️ resume 실패: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "resumed" };
 			}
@@ -762,7 +804,7 @@ export class CommandLayer {
 					await this.say(chatId, "🌱 fork 완료 — 새 세션에서 이어가요.");
 				} catch (error) {
 					this.hub.clearPendingNotice(notice);
-					await this.quietSay(chatId, `⚠️ fork 실패: ${escapeHtml(errorMessage(error))}`);
+					await this.quietSay(chatId, `⚠️ fork 실패: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "forked" };
 			}
@@ -786,7 +828,7 @@ export class CommandLayer {
 					tgDebug("tree: confirmation sent");
 				} catch (error) {
 					tgDebug("tree:pick failed", errorMessage(error));
-					await this.say(chatId, `⚠️ tree 이동 실패: ${escapeHtml(errorMessage(error))}`);
+					await this.say(chatId, `⚠️ tree 이동 실패: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "moved" };
 			}
@@ -858,4 +900,12 @@ export class CommandLayer {
 export function errorMessage(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	return String(error);
+}
+
+/**
+ * Error text for a chat window. pi errors quote provider payloads, and providers quote the
+ * credential the call carried, so nothing raw from an error ever goes to a phone.
+ */
+export function safeError(error: unknown): string {
+	return redactSecrets(errorMessage(error));
 }

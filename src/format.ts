@@ -421,12 +421,49 @@ export function truncate(text: string, maxLength: number): string {
 	return `${trimmed.slice(0, maxLength)}\n\u2026 (${trimmed.length - maxLength} more chars)`;
 }
 
+/**
+ * Secrets this process has actually been handed (the bot token above all). Exact scrubbing catches
+ * shapes no pattern would, and it is what lets us *prove* our own credential cannot ride along in a
+ * chat message, a log line or an error we did not write.
+ */
+const knownSecrets = new Set<string>();
+
+/** Teach the redactor about a credential so it is stripped from every outbound string. */
+export function registerSecret(value: string | undefined): void {
+	const secret = value?.trim();
+	if (secret && secret.length >= 6) knownSecrets.add(secret);
+}
+
+/**
+ * Strip only the exact secrets we know about. Safe enough to apply to everything, including a
+ * mirrored model answer, because it can never mangle unrelated text.
+ */
+export function scrubKnownSecrets(text: string): string {
+	let out = text;
+	for (const secret of knownSecrets) {
+		if (out.includes(secret)) out = out.split(secret).join("[redacted secret]");
+	}
+	return out;
+}
+
+export function knownSecretCount(): number {
+	return knownSecrets.size;
+}
+
 const SECRET_PATTERNS: { pattern: RegExp; redact: (match: string) => string }[] = [
-	// common key prefixes: sk-…, key-…, ghp_…, xoxb-…, AKIA…
+	// telegram bot tokens: <bot id>:<secret> — the one credential this bridge always holds
+	{ pattern: /\b\d{8,12}:[A-Za-z0-9_-]{25,}/g, redact: () => "[telegram bot token redacted]" },
+	// common key prefixes: sk-…, key-…, ghp_…, xoxb-…, AKIA…, AIza…, sk_live_…
 	{ pattern: /\b(?:sk|key|ghp|xox[baprs]|AKIA|AIza)[A-Za-z0-9_-]{12,}\b/g, redact: (match) => `${match.slice(0, 6)}…${match.length - 6} chars` },
-	// Authorization / Bearer values
-	{ pattern: /\b(bearer|authorization|api[_ -]?key|token|secret)\s*[:=]\s*\S+/gi, redact: (match) => `${match.split(/[:=]/, 1)[0]}: [redacted]` },
-	// URLs: host only, so path segments such as /keys/<token> cannot carry a credential
+	// signed JWTs (dots break the long-blob rule below)
+	{ pattern: /\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{2,}){1,2}\b/g, redact: () => "[jwt redacted]" },
+	// `token: xyz`, `token="xyz"` and JSON `"apiKey": "xyz"` — the quoted-key form used to slip through
+	{
+		pattern:
+			/\b(?:bearer|authorization|api[_ -]?key|apikey|access[_ -]?token|refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|secret|password|passwd|pwd|x-api-key|x-goog-api-key|token)\b["']?\s*[:=]\s*["']?[A-Za-z0-9+/_=.\-]{4,}/gi,
+		redact: (match) => `${/^\W*(bearer)/i.test(match) ? "bearer" : match.split(/["']?\s*[:=]/, 1)[0]}: [redacted]`,
+	},
+	// URLs: host only, so path segments such as /keys/<token> or ?key=<token> cannot carry a credential
 	{
 		pattern: /https?:\/\/[^\s"'<]+/gi,
 		redact: (match) => {
@@ -444,10 +481,28 @@ const SECRET_PATTERNS: { pattern: RegExp; redact: (match: string) => string }[] 
  * exactly this). Telegram chats are a second copy of the transcript, so strip secrets first.
  */
 export function redactSecrets(text: string): string {
-	let out = text;
+	let out = scrubKnownSecrets(text);
 	for (const { pattern, redact } of SECRET_PATTERNS) out = out.replace(pattern, redact);
 	// long opaque blobs that are not URLs (tokens pasted into a message body)
 	return out.replace(/\b[A-Za-z0-9+/_-]{32,}=*\b/g, (match) => `${match.slice(0, 6)}…${match.length - 6} chars`);
+}
+
+/**
+ * Count credential-shaped strings, for warning that a file about to leave this machine carries
+ * secrets. Deliberately narrower than redactSecrets: plain URLs must not trip the warning.
+ */
+const CREDENTIAL_SCAN: RegExp[] = [
+	/\b\d{8,12}:[A-Za-z0-9_-]{25,}/g,
+	/\b(?:sk|key|ghp|xox[baprs]|AKIA|AIza)[A-Za-z0-9_-]{12,}/g,
+	/\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{2,}){1,2}/g,
+	/\b(?:bearer|authorization|api[_ -]?key|apikey|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret|password|passwd|pwd|x-api-key|x-goog-api-key|token)["']?\s*[:=]\s*["']?[A-Za-z0-9+/_.=-]{4,}/gi,
+];
+
+export function credentialHits(text: string): number {
+	let count = 0;
+	for (const secret of knownSecrets) if (text.includes(secret)) count += 1;
+	for (const pattern of CREDENTIAL_SCAN) count += (text.match(pattern) ?? []).length;
+	return count;
 }
 
 export function formatDuration(ms: number | undefined): string {

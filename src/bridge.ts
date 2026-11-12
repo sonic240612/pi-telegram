@@ -2,6 +2,7 @@
  * The bridge: owns the Telegram connection, pairs chats, routes inbound updates to pi,
  * and implements the Hub interface that the mirror and command layers build on.
  */
+import { randomBytes, randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -9,7 +10,7 @@ import { Type } from "typebox";
 import { loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
-import { escapeHtml, formatBytes, formatCount, redactSecrets, splitLongLine, tgDebug, toHtmlChunks, truncate } from "./format.ts";
+import { escapeHtml, formatBytes, formatCount, redactSecrets, registerSecret, scrubKnownSecrets, splitLongLine, tgDebug, toHtmlChunks, truncate } from "./format.ts";
 import type { CallbackAction, CallbackEntry, Hub, ModelLike, SendOptions, ShellResult, SessionInfoLike } from "./hub.ts";
 import { CALLBACK_PREFIX, stripCallbackPrefix } from "./hub.ts";
 import { OutboundMirror } from "./mirror.ts";
@@ -22,6 +23,21 @@ const CODE_RE = /(?<!\d)(\d{4,6})(?!\d)/;
 const PAIRING_TTL_MS = 15 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 60 * 1000;
 const MAX_TOKENS = 400;
+/**
+ * A pairing code is the only thing between a stranger who found the bot and a pi session that can
+ * run bash. Six CSPRNG digits, at most a few guesses before the code rotates and the chat is put in
+ * a cooldown, and the operator hears about it.
+ */
+const PAIR_CODE_RANGE: [number, number] = [100_000, 1_000_000];
+const PAIR_MAX_ATTEMPTS = 5;
+const PAIR_COOLDOWN_MS = 5 * 60 * 1000;
+/** Flood control per chat (tokens, refilled per minute) — a flood would cost the bot its quota. */
+const PAIRED_BUDGET = { capacity: 60, refillPerMin: 60 };
+const UNPAIRED_BUDGET = { capacity: 10, refillPerMin: 4 };
+/** One Telegram message can be 4096 chars; beyond this it becomes a file, not a prompt. */
+const MAX_INBOUND_TEXT = 12_000;
+/** A declared attachment bigger than this is not downloaded. */
+const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const ECHO_TTL_MS = 120_000;
 /** How long to wait for pi to start a run after a Telegram prompt before telling the chat. */
 const PROMPT_WATCHDOG_MS = 8000;
@@ -36,6 +52,9 @@ interface PendingChat {
 	label: string;
 	createdAt: number;
 	userId?: number;
+	/** Wrong pairing codes from this chat, and the cooldown they bought it. */
+	attempts?: number;
+	cooldownUntil?: number;
 }
 
 export class TelegramBridge implements Hub {
@@ -59,8 +78,9 @@ export class TelegramBridge implements Hub {
 	private eventCtx?: ExtensionContext;
 
 	private tokens = new Map<string, CallbackEntry>();
-	private tokenSeq = 0;
 	private questionSeq = 0;
+	/** Per-chat inbound allowance, so neither a stranger nor a script can flood the bridge. */
+	private inboundBudget = new Map<number, { tokens: number; at: number; warnedAt?: number }>();
 	private echoes = new Map<string, number>();
 	private pending = new Map<number, PendingChat>();
 	private chatTitles = new Map<number, string>();
@@ -361,6 +381,8 @@ export class TelegramBridge implements Hub {
 					const resolved = isAbsolute(target) ? target : join(ctx.cwd, target);
 					if (!existsSync(resolved)) return { content: [{ type: "text", text: `telegram_send: file not found: ${resolved}` }], details: sendDetails(sent) };
 					const data = Uint8Array.from(readFileSync(resolved));
+					// Any file pi can read can leave this machine through this tool. Say so in the terminal.
+					this.eventCtx?.ui.notify(`telegram_send attached ${resolved} (${formatBytes(data.byteLength)}) to ${this.chats().length} chat(s)`, "info");
 					for (const chatId of this.chats()) {
 						try {
 							await this.sendFile(chatId, data, basename(resolved), params.caption);
@@ -442,6 +464,9 @@ export class TelegramBridge implements Hub {
 			this.eventCtx?.ui.notify("telegram: no token. run /telegram-setup <bot-token> or set TELEGRAM_BOT_TOKEN.", "warning");
 			return { ok: false, error: "no token configured" };
 		}
+		// Everything this bridge writes to chats, files and stderr is scrubbed of the token from here on:
+		// it travels in every request path, so it must never appear in a message we did not author.
+		registerSecret(token);
 		await this.stop(undefined, true);
 		// A replacement session builds this instance while the previous one is still writing config;
 		// pick up whatever it persisted so no update is replayed and no notice is lost.
@@ -621,6 +646,22 @@ export class TelegramBridge implements Hub {
 		if (update.callback_query) await this.handleCallbackQuery(update.callback_query);
 	}
 
+	/** Token bucket per chat: burst allowance refilled over time. True means "you may proceed". */
+	private allowInbound(chatId: number, paired: boolean): boolean {
+		const budget = paired ? PAIRED_BUDGET : UNPAIRED_BUDGET;
+		const now = Date.now();
+		const entry = this.inboundBudget.get(chatId) ?? { tokens: budget.capacity, at: now };
+		entry.tokens = Math.min(budget.capacity, entry.tokens + ((now - entry.at) / 60_000) * budget.refillPerMin);
+		entry.at = now;
+		if (entry.tokens < 1) {
+			this.inboundBudget.set(chatId, entry);
+			return false;
+		}
+		entry.tokens -= 1;
+		this.inboundBudget.set(chatId, entry);
+		return true;
+	}
+
 	private rememberChat(message: TgMessage): string {
 		const chatId = message.chat.id;
 		const label = message.chat.title ?? [message.chat.first_name, message.chat.last_name].filter(Boolean).join(" ") ?? message.chat.username ?? `chat ${chatId}`;
@@ -634,7 +675,28 @@ export class TelegramBridge implements Hub {
 		const text = (message.text ?? message.caption ?? "").trim();
 
 		if (!this.isPaired(chatId)) {
+			// Strangers get a strict budget and no reply once it runs out: an unanswered bot does not
+			// burn the quota that the operator's mirrored answers need.
+			if (!this.allowInbound(chatId, false)) {
+				this.dbg("unpaired flood dropped", chatId);
+				return;
+			}
 			await this.handleUnpairedChat(chatId, label, text, message);
+			return;
+		}
+		if (!this.allowInbound(chatId, true)) {
+			const budget = this.inboundBudget.get(chatId);
+			if (!budget?.warnedAt || Date.now() - budget.warnedAt > 60_000) {
+				if (budget) budget.warnedAt = Date.now();
+				await this.sendHtml(chatId, `⏳ <i>너무 빨라요 — 잠시 후 다시 보내 주세요 (1분당 약 ${PAIRED_BUDGET.refillPerMin}개 처리).</i>`);
+			}
+			return;
+		}
+		if (text.length > MAX_INBOUND_TEXT) {
+			await this.sendHtml(
+				chatId,
+				`⚠️ <i>지나치게 긴 메시지예요 (${text.length}자, 최대 ${MAX_INBOUND_TEXT}). 파일로 보내 주시면 전체를 읽을 수 있어요 — 예: /bash 로 읽히기.</i>`,
+			);
 			return;
 		}
 		if (edited) {
@@ -661,10 +723,32 @@ export class TelegramBridge implements Hub {
 	private async handleUnpairedChat(chatId: number, label: string, text: string, message: TgMessage): Promise<void> {
 		const entry = this.pending.get(chatId);
 		const codeMatch = CODE_RE.exec(text);
+		if (entry && entry.cooldownUntil && Date.now() < entry.cooldownUntil) {
+			const wait = Math.ceil((entry.cooldownUntil - Date.now()) / 1000);
+			await this.sendHtml(chatId, `⏳ <i>코드를 ${PAIR_MAX_ATTEMPTS}번 틀려서 일시 정지 — ${wait}초 후 새 코드로 다시 시도하세요. 운영자에게 알렸어요.</i>`);
+			return;
+		}
 		if (entry && codeMatch && entry.code === codeMatch[1]) {
 			this.approvePending(entry);
 			await this.sendHtml(chatId, "✅ paired! 텍스트는 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.");
 			this.eventCtx?.ui.notify(`telegram paired: ${label} (${chatId})`, "info");
+			return;
+		}
+		if (entry && codeMatch) {
+			// A wrong code is someone trying to get in. Rotate, cool down, and tell the operator.
+			entry.attempts = (entry.attempts ?? 0) + 1;
+			if (entry.attempts >= PAIR_MAX_ATTEMPTS) {
+				entry.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS;
+				entry.code = randomCode();
+				entry.attempts = 0;
+				this.eventCtx?.ui.notify(
+					`telegram: ${label} (${chatId}) guessed pairing codes ${PAIR_MAX_ATTEMPTS} times — code rotated, chat on cooldown for ${PAIR_COOLDOWN_MS / 60_000} minutes`,
+					"warning",
+				);
+				await this.sendHtml(chatId, `⛔ <i>코드를 여러 번 틀렸어요. 코드가 바뀌었고 잠시 후 다시 시도할 수 있어요.</i>`);
+				return;
+			}
+			await this.sendHtml(chatId, `⛔ <i>그 코드가 아니에요 (${entry.attempts}/${PAIR_MAX_ATTEMPTS}). 운영자에게 코드를 다시 물어보세요.</i>`);
 			return;
 		}
 		const fresh: PendingChat = entry ?? { chatId, code: randomCode(), label, createdAt: Date.now(), userId: message.from?.id };
@@ -673,7 +757,7 @@ export class TelegramBridge implements Hub {
 		this.prunePending();
 		await this.sendHtml(
 			chatId,
-			`🔒 <b>pairing 필요</b>\npi 운영자가 pi 터미널에서 확인해야 합니다:\n1. <code>/telegram-pair</code> → 대기 목록과 코드 확인\n2. pi에서 <code>/telegram-pair &lt;code&gt;</code> 실행\n\n또는 운영자가 보내준 4자리 코드를 여기에 입력하면 허용됩니다.`,
+			`🔒 <b>pairing 필요</b>\npi 운영자가 pi 터미널에서 확인해야 합니다:\n1. <code>/telegram-pair</code> → 대기 목록과 코드 확인\n2. pi에서 <code>/telegram-pair &lt;code&gt;</code> 실행\n\n또는 운영자가 보내준 ${PAIR_CODE_RANGE[0].toString().length}자리 코드를 여기에 입력하면 허용됩니다.`,
 		);
 		this.eventCtx?.ui.notify(`telegram pairing request: ${label} (${chatId}) → code ${fresh.code} (approve with /telegram-pair ${fresh.code})`, "info");
 	}
@@ -841,7 +925,11 @@ export class TelegramBridge implements Hub {
 			}
 		}
 		const document = message.document;
-		if (document) {
+		const oversized = Boolean(document?.file_size && document.file_size > MAX_ATTACHMENT_BYTES);
+		if (oversized && document?.file_size) {
+			notes.push(`파일이 너무 커요 (${formatBytes(document.file_size)}, 최대 ${formatBytes(MAX_ATTACHMENT_BYTES)}) — 더 작은 조각으로 보내 주세요`);
+		}
+		if (document && !oversized) {
 			const mime = document.mime_type ?? "";
 			this.dbg("attachment document", document.file_name ?? "?", mime || "(no mime)");
 			if (mime.startsWith("image/")) {
@@ -854,14 +942,14 @@ export class TelegramBridge implements Hub {
 				try {
 					const raw = await this.download(document.file_id);
 					this.dbg("document inlined", document.file_name, raw.byteLength, "bytes");
-					const name = document.file_name ?? "attachment";
+					const name = safeFileName(document.file_name ?? "attachment");
 					const body = Buffer.from(raw).toString("utf8");
 					this.pi.sendUserMessage([{ type: "text", text: `Attached file from Telegram: ${name}\n\n\`\`\`\n${truncate(body, 24_000)}\n\`\`\`` }]);
 				} catch (error) {
 					notes.push(`file read failed: ${errorMessage(error)}`);
 				}
 			} else {
-				notes.push(`unsupported attachment: ${document.file_name ?? mime ?? "file"} (${formatBytes(document.file_size ?? 0)}) — save it locally and reference the path`);
+				notes.push(`unsupported attachment: ${safeFileName(document.file_name ?? "")} (${formatBytes(document.file_size ?? 0)}) — save it locally and reference the path`);
 			}
 		}
 		if (message.audio || message.voice) notes.push("voice messages are not transcribed — send text");
@@ -904,6 +992,15 @@ export class TelegramBridge implements Hub {
 			if (query.message && chatId) await this.bot?.clearKeyboard(chatId, query.message.message_id);
 			return;
 		}
+		if (entry.chatId !== chatId) {
+			// A button is for the chat it was rendered into. Without this, any paired chat (or any member
+			// of a paired group) could replay another chat's keyboard — switch models, resume a foreign
+			// session, unpair a chat.
+			await this.bot?.answerCallbackQuery(query.id, "이 버튼은 다른 채팅에서 열린 거예요", true);
+			this.dbg("callback token from the wrong chat", chatId, "->", entry.chatId);
+			this.eventCtx?.ui.notify(`telegram: ignored a keyboard tap from chat ${chatId} — that button belongs to ${entry.chatId}`, "warning");
+			return;
+		}
 		if (entry.action.kind === "ask:answer") {
 			const value = entry.action.value ?? "";
 			entry.answer?.resolve(value);
@@ -925,6 +1022,9 @@ export class TelegramBridge implements Hub {
 
 	async send(chatId: number, text: string, options: SendOptions = {}): Promise<void> {
 		if (!this.bot) throw new Error("telegram bridge is not running");
+		// Exact known secrets (our own bot token above all) never ride along, whoever authored the text.
+		if (this.cfg.redactTranscript) text = redactSecrets(text);
+		text = scrubKnownSecrets(text);
 		const markup = options.keyboard?.length ? { inline_keyboard: options.keyboard } : undefined;
 		const base = {
 			...(markup ? { reply_markup: markup } : {}),
@@ -955,6 +1055,8 @@ export class TelegramBridge implements Hub {
 
 	async sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: string): Promise<void> {
 		if (!this.bot) throw new Error("telegram bridge is not running");
+		// A file leaves this machine for Telegram's servers and the phone: scrub our own credentials.
+		caption = caption ? scrubKnownSecrets(caption) : caption;
 		if (/\.(png|jpe?g|gif|webp)$/i.test(fileName)) await this.bot.sendPhoto(chatId, data, fileName, caption);
 		else await this.bot.sendDocument(chatId, data, fileName, caption);
 	}
@@ -1360,7 +1462,8 @@ export class TelegramBridge implements Hub {
 	 * accept either form.
 	 */
 	createToken(action: CallbackAction, chatId: number, answer?: CallbackEntry["answer"]): string {
-		const token = `k${(++this.tokenSeq).toString(36)}`;
+		// Random, not sequential: a counter hands anyone who can send a callback the whole button space.
+		const token = randomBytes(9).toString("base64url");
 		this.tokens.set(token, { action, chatId, createdAt: Date.now(), answer });
 		this.pruneTokens();
 		return `${CALLBACK_PREFIX}${token}`;
@@ -1431,6 +1534,9 @@ export class TelegramBridge implements Hub {
 		const before = this.cfg.chats.length;
 		this.cfg.chats = this.cfg.chats.filter((chat) => chat.chatId !== chatId);
 		if (this.cfg.chats.length === before) return false;
+		// Revoke every button that chat was ever handed, or a revoked chat keeps live controls.
+		for (const [token, entry] of this.tokens) if (entry.chatId === chatId) this.tokens.delete(token);
+		this.drafts.discard(chatId);
 		writeConfigNow(this.cfg);
 		return true;
 	}
@@ -1664,8 +1770,15 @@ function askDetails(answered: boolean, answer?: string): AskDetails {
 	return { answered, ...(answer != null ? { answer } : {}) };
 }
 
+/** A Telegram file name ends up in the model prompt: keep it to one harmless line. */
+function safeFileName(value: string): string {
+	const cleaned = value.replace(/[^\p{L}\p{N} .()\[\]_-]+/gu, " ").replace(/\s+/g, " ").trim();
+	return cleaned.slice(0, 120) || "attachment";
+}
+
 function randomCode(): string {
-	return String(1000 + Math.floor(Math.random() * 9000));
+	// CSPRNG: Math.random() is seedable, and this code is the gate into a shell-capable session.
+	return String(randomInt(PAIR_CODE_RANGE[0], PAIR_CODE_RANGE[1]));
 }
 
 function normalize(text: string): string {

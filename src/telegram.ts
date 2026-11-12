@@ -2,6 +2,7 @@
  * Minimal Telegram Bot API client. No dependencies: global fetch + FormData.
  * Requests are serialized with a small delay, and 429 responses honour `retry_after`.
  */
+import { scrubKnownSecrets } from "./format.ts";
 
 export interface TgUser {
 	id: number;
@@ -165,7 +166,52 @@ export class TelegramBot {
 	}
 
 	get apiRoot(): string {
-		return process.env.TELEGRAM_API_ROOT?.trim() || API_ROOT;
+		return this.checkedApiRoot();
+	}
+
+	/**
+	 * The bot token travels inside the request path, so the host we point at receives it. Refuse to
+	 * send it in plain http to anywhere that is not loopback (the offline tests run a local mock), and
+	 * say out loud when a third-party host is being trusted.
+	 */
+	private checkedApiRoot(): string {
+		const configured = process.env.TELEGRAM_API_ROOT?.trim();
+		if (!configured) return API_ROOT;
+		let url: URL;
+		try {
+			url = new URL(configured);
+		} catch {
+			throw new TelegramError("config", 0, "TELEGRAM_API_ROOT is not a valid URL");
+		}
+		const loopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]" || url.hostname === "::1";
+		if (url.protocol !== "https:" && !loopback) {
+			throw new TelegramError(
+				"config",
+				0,
+				`TELEGRAM_API_ROOT must be https (got ${url.protocol}//${url.hostname}) — the bot token would leave this machine in the clear`,
+			);
+		}
+		if (url.hostname !== "api.telegram.org" && !loopback && !this.foreignHostWarned) {
+			this.foreignHostWarned = true;
+			console.error(`[pi-telegram] TELEGRAM_API_ROOT points at ${url.hostname} — that host receives the bot token.`);
+		}
+		return configured.replace(/\/+$/, "");
+	}
+
+	private foreignHostWarned = false;
+
+	/** Never let the token appear in an error message: fetch/undici can quote the request URL. */
+	private scrub(text: string): string {
+		return this.token ? text.split(this.token).join("[redacted token]") : text;
+	}
+
+	/**
+	 * The last gate before anything leaves for Telegram. Exact known secrets (this bot's token above
+	 * all) are removed whatever the caller meant to send: an answer that quotes the token, a bash log,
+	 * a streaming draft. Pattern-based scrubbing stays a policy decision in the layer above.
+	 */
+	private out(text: string): string {
+		return this.scrub(scrubKnownSecrets(text));
 	}
 
 	/** Serialize all API calls; Telegram rate limits are per-bot and forgiving of a queue. */
@@ -281,12 +327,19 @@ export class TelegramBot {
 
 	private async send<T>(method: string, body: BodyInit, contentType: string | undefined, timeoutMs: number): Promise<T> {
 		// A wedged request would otherwise park the whole send lane, so every call has a budget.
-		const response = await fetch(`${this.apiRoot}/bot${this.token}/${method}`, {
-			method: "POST",
-			body,
-			signal: AbortSignal.timeout(timeoutMs),
-			...(contentType ? { headers: { "content-type": contentType } } : {}),
-		});
+		let response: Response;
+		try {
+			response = await fetch(`${this.apiRoot}/bot${this.token}/${method}`, {
+				method: "POST",
+				body,
+				signal: AbortSignal.timeout(timeoutMs),
+				...(contentType ? { headers: { "content-type": contentType } } : {}),
+			});
+		} catch (error) {
+			// undici can name the failing URL, which carries the token — keep it out of the message.
+			const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+			throw new TelegramError(method, 0, `network failure — ${this.scrub(reason)}`);
+		}
 		let payload: { ok: boolean; description?: string; result?: T; parameters?: { retry_after?: number } };
 		try {
 			payload = (await response.json()) as typeof payload;
@@ -294,7 +347,7 @@ export class TelegramBot {
 			throw new TelegramError(method, response.status, `non-JSON response (HTTP ${response.status})`);
 		}
 		if (!payload.ok) {
-			throw new TelegramError(method, response.status, payload.description ?? "request failed", payload.parameters?.retry_after);
+			throw new TelegramError(method, response.status, this.scrub(payload.description ?? "request failed"), payload.parameters?.retry_after);
 		}
 		return payload.result as T;
 	}
@@ -327,7 +380,7 @@ export class TelegramBot {
 		const { reply_markup, ...rest } = options;
 		return this.api<TgMessage>("sendMessage", {
 			chat_id: chatId,
-			text,
+			text: this.out(text),
 			...rest,
 			reply_markup: clampMarkup(reply_markup),
 			disable_web_page_preview: options.disable_web_page_preview ?? true,
@@ -362,7 +415,7 @@ export class TelegramBot {
 		return this.api<TgMessage>("editMessageText", {
 			chat_id: chatId,
 			message_id: messageId,
-			text,
+			text: this.out(text),
 			...rest,
 			reply_markup: clampMarkup(reply_markup),
 			disable_web_page_preview: options.disable_web_page_preview ?? true,
@@ -403,7 +456,7 @@ export class TelegramBot {
 		form.append("chat_id", String(chatId));
 		form.append("document", new Blob([toBytes(file)]), fileName);
 		if (caption) {
-			form.append("caption", caption);
+			form.append("caption", this.out(caption));
 			form.append("parse_mode", "HTML");
 		}
 		form.append("disable_notification", "false");
@@ -415,7 +468,7 @@ export class TelegramBot {
 		form.append("chat_id", String(chatId));
 		form.append("photo", new Blob([toBytes(file)]), fileName);
 		if (caption) {
-			form.append("caption", caption);
+			form.append("caption", this.out(caption));
 			form.append("parse_mode", "HTML");
 		}
 		return this.apiMultipart<TgMessage>("sendPhoto", form);
@@ -426,8 +479,22 @@ export class TelegramBot {
 	}
 
 	async downloadFile(filePath: string, maxBytes = 8 * 1024 * 1024): Promise<Uint8Array> {
-		const response = await fetch(`${this.apiRoot}/file/bot${this.token}/${encodeURI(filePath)}`);
+		// The path comes from the API, so treat it as untrusted input: no traversal, no absolute paths.
+		const safe = String(filePath).replace(/^\/+/, "");
+		if (!safe || safe.includes("..") || safe.includes("\\")) throw new TelegramError("downloadFile", 400, "telegram returned an unusable file path");
+		let response: Response;
+		try {
+			response = await fetch(`${this.apiRoot}/file/bot${this.token}/${encodeURI(safe)}`, { signal: AbortSignal.timeout(60_000) });
+		} catch (error) {
+			const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+			throw new TelegramError("downloadFile", 0, `network failure — ${this.scrub(reason)}`);
+		}
 		if (!response.ok) throw new TelegramError("downloadFile", response.status, `download failed (HTTP ${response.status})`);
+		// Fail before buffering a file we would throw away anyway.
+		const declared = Number(response.headers.get("content-length") ?? "0");
+		if (Number.isFinite(declared) && declared > maxBytes) {
+			throw new TelegramError("downloadFile", 413, `file larger than ${maxBytes} bytes`);
+		}
 		const buffer = new Uint8Array(await response.arrayBuffer());
 		if (buffer.byteLength > maxBytes) throw new TelegramError("downloadFile", 413, `file larger than ${maxBytes} bytes`);
 		return buffer;

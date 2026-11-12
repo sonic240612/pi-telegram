@@ -7,16 +7,18 @@
  *
  *   node scripts/smoke.ts        (or: npm run smoke)
  *
- * Covers: pairing gate, prompts, answers (draft-in-place vs chunked), per-turn tool summaries,
- * verbosity levels, inline keyboards for model/thinking/tools/commands/resume/fork/tree/chats,
- * command passthrough, attachments, /bash, /export, /compact, /abort, /steer, /queue,
- * telegram_send, telegram_ask, multi-chat mirroring, config persistence.
+ * Covers: pairing gate and code guessing, prompts, answers (draft-in-place vs chunked), per-turn tool
+ * summaries, verbosity levels, inline keyboards for model/thinking/tools/commands/resume/fork/tree/chats,
+ * command passthrough, attachments, /bash, /export, /compact, /abort, /steer, /queue, telegram_send,
+ * telegram_ask, multi-chat mirroring, credential scrubbing, flood control, cross-chat keyboards,
+ * config persistence and file permissions.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftHtml, mdToHtml, toHtmlChunks } from "../src/format.ts";
+import { TelegramBot } from "../src/telegram.ts";
 
 // ── isolated pi dir + workspace before any project import ──────────────────────────
 const agentDir = mkdtempSync(join(tmpdir(), "pi-tg-agent-"));
@@ -505,6 +507,9 @@ function check(description: string, ok: boolean, detail = ""): void {
 
 const CHAT = 555000111;
 const OTHER = 555000222;
+/** Mirrors of the bridge's flood budgets — the test asserts the cap on purpose. */
+const UNPAIRED_ALLOWANCE = 10;
+const PAIRED_ALLOWANCE = 60;
 const EXTRA = 777000333;
 
 console.log("pi-telegram smoke test");
@@ -522,7 +527,7 @@ check("registers CLI flags", registeredFlags.has("telegram-off") && registeredFl
 pushMessage(OTHER, "hello?");
 await waitFor("pairing prompt", () => sentMessages("pairing 필요").some((call) => Number(call.params.chat_id) === OTHER));
 const pairingNotice = notices.find((notice) => notice.message.includes("pairing request"));
-const code = /code (\d{4})/.exec(pairingNotice?.message ?? "")?.[1];
+const code = /code (\d{4,6})/.exec(pairingNotice?.message ?? "")?.[1];
 check("unpaired chat is gated with a pairing request", Boolean(code), `notice=${pairingNotice?.message ?? "(none)"}`);
 check("pairing code is not leaked to the unpaired chat", !lastTextFor(OTHER).includes(code ?? "0000"), lastTextFor(OTHER).slice(0, 120));
 
@@ -535,6 +540,34 @@ check("pi-side /telegram-pair <code> approves the chat", true);
 commandHandlers.get("telegram")?.("add 555000111", ctx);
 await waitFor("operator chat paired", () => readFileSync(configPath, "utf8").includes(String(CHAT)));
 check("/telegram add <chatId> pairs a chat", true);
+
+// 2b. the pairing code is the only gate between a stranger and a shell-capable pi session
+check("pairing codes are six digits", /^\d{6}$/.test(code ?? ""), `code=${code ?? "(none)"}`);
+const BRUTE = 555000444;
+for (let attempt = 0; attempt < 6; attempt += 1) pushMessage(BRUTE, String(100000 + attempt));
+await waitFor("code guessing locked out", () => textMessages("코드를 여러 번 틀렸어요").some((call) => Number(call.params.chat_id) === BRUTE), 8000);
+check("guessing pairing codes rotates the code", true);
+check(
+	"a code-guessing attempt is reported to the operator",
+	notices.some((notice) => /guessed pairing codes/i.test(notice.message)),
+	notices.map((notice) => notice.message).join(" | ").slice(0, 200),
+);
+pushMessage(BRUTE, "123456");
+await waitFor("cooldown notice", () => textMessages("일시 정지").some((call) => Number(call.params.chat_id) === BRUTE), 8000);
+check("a cooled-down chat is not handed another set of guesses", true);
+commandHandlers.get("telegram-pair")?.("", ctx);
+await waitFor("pending list shows a rotated code", () => notices.some((notice) => notice.message.includes("pending:") && new RegExp(`\\(${BRUTE}\\) → code \\d{6}`).test(notice.message)));
+const bruteCodes = notices
+	.filter((notice) => notice.message.includes(String(BRUTE)))
+	.flatMap((notice) => [...notice.message.matchAll(new RegExp(`\\(${BRUTE}\\) → code (\\d{6})`, "g"))].map((match) => match[1]));
+const rotated = bruteCodes.at(-1);
+check("guessing rotates the code, and only the operator sees it", bruteCodes.length >= 2 && rotated !== bruteCodes[0], bruteCodes.join(" -> ") || "(no codes)");
+commandHandlers.get("telegram-pair")?.(rotated ?? "", ctx);
+await waitFor("rotated code pairs from the pi side", () => textMessages("pairing approved").some((call) => Number(call.params.chat_id) === BRUTE), 8000);
+check("the operator can still approve the rotated code", true);
+pushMessage(BRUTE, "/tg unpair");
+await waitFor("the guessed chat is revoked", () => textMessages("허용 목록에서 뺐어요").some((call) => Number(call.params.chat_id) === BRUTE), 8000);
+check("a chat guessed into can be revoked again", true);
 
 // 3. plain prompt -> pi
 pushMessage(CHAT, "hello pi, please read src/index.ts");
@@ -803,7 +836,9 @@ const askTool = registeredTools.find((tool) => tool.name === "telegram_ask")!;
 const askPromise = askTool.execute("id2", { question: "Which build?", options: ["debug", "release"], timeout_seconds: 60 }, undefined, undefined, ctx);
 await waitFor("ask buttons", () => lastKeyboard("Which build?").length > 0);
 const askRows = lastKeyboard("Which build?");
-pushCallback(CHAT, Number(sentMessages("Which build?").at(-1)?.params.message_id ?? 0), buttons(askRows)[1].callback_data);
+// A button answers the chat it was shown in — tapping it from another chat is refused on purpose.
+const askChat = Number(sentMessages("Which build?").at(-1)?.params.chat_id ?? CHAT);
+pushCallback(askChat, Number(sentMessages("Which build?").at(-1)?.params.message_id ?? 0), buttons(askRows)[1].callback_data);
 const askResult = (await askPromise) as { content: { text: string }[]; details: { answered?: boolean; answer?: string } };
 check("telegram_ask waits for the tapped button and returns it", askResult.content[0].text === "release" && askResult.details.answered === true, JSON.stringify(askResult));
 
@@ -1175,12 +1210,100 @@ const oversizedButtons = calls
 	.filter((button) => button.text.length > 64 || new TextEncoder().encode(button.callback_data ?? "").byteLength > 64);
 check("no keyboard button exceeds telegram's own limits", oversizedButtons.length === 0, JSON.stringify(oversizedButtons[0] ?? {}).slice(0, 160));
 
+// 21c. security: credentials, floods, stolen keyboards, untrusted input
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
+check("the bridge knows its own token is a secret", BOT_TOKEN.length > 0);
+emit("message_start", { type: "message_start", message: { role: "assistant", content: [] } });
+emit("message_end", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `my bot token is ${BOT_TOKEN} — keep it safe` }] } });
+await waitFor("token-bearing answer mirrored", () => sentMessages("my bot token is").length > 0, 8000);
+check(
+	"our own token never reaches a chat, even when pi prints it",
+	!calls.some((call) => JSON.stringify(call.params).includes(BOT_TOKEN)),
+	JSON.stringify(calls.find((call) => JSON.stringify(call.params).includes(BOT_TOKEN))?.params ?? "").slice(0, 120),
+);
+
+// the live draft is a different path out of the bridge, so prove it is scrubbed as well
+pushMessage(CHAT, "/stream on");
+await waitFor("drafts back on", () => textMessages("실시간 초안 on").some((call) => Number(call.params.chat_id) === CHAT), 8000);
+idle = false;
+emit("agent_start", { type: "agent_start" });
+emit("turn_start", { type: "turn_start", turnIndex: 0 });
+emit("message_start", { type: "message_start", message: { role: "assistant", content: [] } });
+emit("message_update", { type: "message_update", message: { role: "assistant", content: [{ type: "text", text: `streaming token ${BOT_TOKEN}` }] } });
+await waitFor("draft shows the answer", () => calls.some((call) => (call.method === "editMessageText" || call.method === "sendMessage") && String(call.params.text).includes("streaming token")), 12_000);
+check("a live streaming draft never carries our token either", !calls.some((call) => JSON.stringify(call.params).includes(BOT_TOKEN)));
+const streamed = `streaming token ${BOT_TOKEN}`;
+emit("message_end", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: streamed }] } });
+emit("turn_end", { type: "turn_end", turnIndex: 0, message: { role: "assistant", content: [{ type: "text", text: streamed }] }, toolResults: [] });
+emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: streamed }] }] });
+emit("agent_settled", { type: "agent_settled", aborted: false });
+idle = true;
+await sleep(300);
+pushMessage(CHAT, "/stream off");
+await waitFor("drafts back off", () => textMessages("실시간 초안 off").some((call) => Number(call.params.chat_id) === CHAT), 8000);
+
+pushMessage(CHAT, "x".repeat(13_000));
+await waitFor("oversized message refused", () => textMessages("지나치게 긴 메시지").length > 0, 8000);
+check("an oversized prompt is refused rather than dumped into pi", !userMessages.some((entry) => String(entry.content).includes("x".repeat(200))));
+
+pushMessage(CHAT, "huge file", { document: { file_id: "big1", file_name: "huge.bin", mime_type: "application/octet-stream", file_size: 40 * 1024 * 1024 } });
+await waitFor("oversized attachment refused", () => textMessages("파일이 너무 커요").length > 0, 8000);
+check("an oversized attachment is never downloaded", !calls.some((call) => call.method === "getFile" && call.params.file_id === "big1"));
+
+const SPAM = 555000777;
+for (let i = 0; i < 24; i += 1) pushMessage(SPAM, `spam ${i}`);
+await sleep(600);
+const spamReplies = textMessages().filter((call) => Number(call.params.chat_id) === SPAM).length;
+check("a stranger flooding the bot is cut off", spamReplies > 0 && spamReplies <= UNPAIRED_ALLOWANCE, `${spamReplies} replies to 24 messages`);
+
+const promptFloor = userMessages.length;
+for (let i = 0; i < 120; i += 1) pushMessage(CHAT, `flood ${i}`);
+await waitFor("flooding chat throttled", () => textMessages("너무 빨라요").some((call) => Number(call.params.chat_id) === CHAT), 12_000);
+const floodDelivered = userMessages.slice(promptFloor).filter((entry) => String(entry.content).includes("flood ")).length;
+check("a flooding chat cannot outrun the bot's send quota", floodDelivered > 0 && floodDelivered <= PAIRED_ALLOWANCE && floodDelivered < 120, `${floodDelivered} of 120 reached pi`);
+
+pushMessage(CHAT, "/thinking");
+await waitFor("thinking keyboard", () => buttons(lastKeyboard("thinking")).length > 0, 8000);
+const borrowed = buttons(lastKeyboard("thinking")).find((button) => (button.callback_data ?? "").startsWith("t:"));
+const THIEF = 555000999;
+const thinkingBefore = thinkingLevel;
+commandHandlers.get("telegram")?.(`add ${THIEF}`, ctx);
+await sleep(150);
+pushCallback(THIEF, 4242, borrowed?.callback_data ?? "t:none");
+await waitFor("cross-chat keyboard tap refused", () => calls.some((call) => call.method === "answerCallbackQuery" && String(call.params.text).includes("다른 채팅")), 8000);
+check("a keyboard tap from another chat is refused", true);
+check("the borrowed tap did not act on pi", thinkingLevel === thinkingBefore, `thinkingLevel ${thinkingBefore} -> ${thinkingLevel}`);
+
+const savedRoot = process.env.TELEGRAM_API_ROOT;
+process.env.TELEGRAM_API_ROOT = "http://telegram-mirror.example.com";
+let refused = "";
+try {
+	new TelegramBot(BOT_TOKEN).apiRoot;
+} catch (error) {
+	refused = error instanceof Error ? error.message : String(error);
+}
+process.env.TELEGRAM_API_ROOT = savedRoot;
+check("TELEGRAM_API_ROOT cannot point at a plain-http third-party host", /must be https/.test(refused), refused.slice(0, 140));
+
+if (process.platform !== "win32") {
+	const mode = statSync(configPath).mode;
+	check("the file holding the bot token is owner-only", (mode & 0o077) === 0, `mode=${(mode & 0o777).toString(8)}`);
+} else {
+	console.log("  --   file mode check skipped (windows uses ACLs, not mode bits)");
+}
+const tokenSamples = calls
+	.flatMap((call) => ((call.params.reply_markup as { inline_keyboard?: { callback_data?: string }[][] } | undefined)?.inline_keyboard ?? []).flat())
+	.map((button) => (button.callback_data ?? "").slice(2))
+	.filter((value) => value.length >= 8);
+
 // 22. shutdown persists config
 emit("session_shutdown", { reason: "quit" });
 await sleep(200);
 const saved = JSON.parse(readFileSync(configPath, "utf8")) as { offset?: number; chats: unknown[]; verbosity?: number };
 check("config persists chats, verbosity and update offset", saved.offset !== undefined && Array.isArray(saved.chats) && saved.verbosity === 0, JSON.stringify(saved).slice(0, 200));
-check("no keyboard tokens leak into config", !JSON.stringify(saved).includes("k1"));
+check("the config write leaves no temp copy of the token behind", !existsSync(`${configPath}.tmp`));
+const leakedTokens = tokenSamples.filter((token) => token && readFileSync(configPath, "utf8").includes(token));
+check("no keyboard tokens leak into config", leakedTokens.length === 0, `${tokenSamples.length} sampled, leaked: ${leakedTokens.slice(0, 2).join(",")}`);
 
 server.close();
 console.log(`\n${checks - failures}/${checks} checks passed · ${calls.length} Telegram API calls`);

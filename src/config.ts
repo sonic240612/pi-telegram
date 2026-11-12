@@ -2,7 +2,7 @@
  * Persistent bridge configuration.
  * Stored at ~/.pi/agent/telegram.json so it survives `/reload` and pi restarts.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -27,6 +27,13 @@ export interface TelegramConfig {
 	/** Send a notice when the bridge connects/disconnects. */
 	announce: boolean;
 	/**
+	 * Scrub credential-looking text out of copies the bridge makes for Telegram — bash output and its
+	 * own failure lines. The pi terminal still shows the raw text; only the second copy is cleaned.
+	 */
+	redactBash: boolean;
+	/** Also scrub the mirrored pi transcript. Off by default: detail mode should match the terminal. */
+	redactTranscript: boolean;
+	/**
 	 * One-shot chat notice carried across a session replacement. new/fork/resume dispose the pi
 	 * session and re-create this extension, so the instance that started the action is gone before
 	 * it can confirm; the fresh instance delivers this notice when it reconnects.
@@ -39,6 +46,8 @@ export const DEFAULT_CONFIG: TelegramConfig = {
 	verbosity: 1,
 	streaming: true,
 	announce: true,
+	redactBash: true,
+	redactTranscript: false,
 };
 
 /** A queued restart notice older than this is dropped — it belongs to an action long finished. */
@@ -48,9 +57,23 @@ export function configPath(): string {
 	return join(getAgentDir(), "telegram.json");
 }
 
+/**
+ * This file holds the bot token — anyone who can read it can read the mirrored transcript and issue
+ * prompts as pi. Keep it owner-only. Windows uses ACLs instead of mode bits, so failures are ignored.
+ */
+export function hardenFileMode(path: string): void {
+	try {
+		chmodSync(path, 0o600);
+	} catch {
+		/* no POSIX permissions on this platform */
+	}
+}
+
 export function loadConfig(): TelegramConfig {
 	const path = configPath();
 	if (!existsSync(path)) return structuredClone(DEFAULT_CONFIG);
+	// Repair a config file left world-readable by an older version before we read its contents.
+	hardenFileMode(path);
 	let raw: unknown;
 	try {
 		raw = JSON.parse(readFileSync(path, "utf8"));
@@ -69,6 +92,8 @@ export function loadConfig(): TelegramConfig {
 	if (value.verbosity === 0 || value.verbosity === 1 || value.verbosity === 2) cfg.verbosity = value.verbosity;
 	if (typeof value.streaming === "boolean") cfg.streaming = value.streaming;
 	if (typeof value.announce === "boolean") cfg.announce = value.announce;
+	if (typeof value.redactBash === "boolean") cfg.redactBash = value.redactBash;
+	if (typeof value.redactTranscript === "boolean") cfg.redactTranscript = value.redactTranscript;
 	if (typeof value.offset === "number") cfg.offset = value.offset;
 	const notice = value.pendingNotice;
 	if (notice && typeof notice.text === "string" && typeof notice.at === "number" && Date.now() - notice.at < NOTICE_TTL_MS) {
@@ -93,8 +118,11 @@ export function writeConfigNow(config: TelegramConfig): void {
 	const path = configPath();
 	mkdirSync(dirname(path), { recursive: true });
 	const tmp = `${path}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+	// mode on create + chmod after, so a pre-existing temp file cannot keep looser permissions
+	writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	hardenFileMode(tmp);
 	renameSync(tmp, path);
+	hardenFileMode(path);
 }
 
 export function resolveToken(config: TelegramConfig): string | undefined {
