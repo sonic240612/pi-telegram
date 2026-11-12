@@ -2,6 +2,8 @@
 
 Drive a **running [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) session from Telegram**.
 
+[한국어 README](README.ko.md)
+
 pi keeps owning the session. The extension mirrors what the terminal shows, turns Telegram text and
 attachments into pi prompts, and re-implements the pi commands that matter as chat messages with
 inline keyboards. One running pi session ↔ one or more Telegram chats.
@@ -130,7 +132,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tg verbose [0\|1\|2]` · `/tg stream [on\|off]` | | Same as the top-level commands. |
 | `/tg stats` (alias `/tg latency`) | — | Telegram call count / average / max, poll count, slow calls, 429s, and prompt → run-start delay. Tells you whether a slow reply is pi thinking or the network. |
 | `/tg menu` | — | Re-register the “/” autocomplete menu and verify what Telegram serves. Use it when the autocomplete list looks wrong (see below). |
-| `/tg redact [on\|off]` · `/tg redact transcript [on\|off]` | | Control how much credential scrubbing the bridge applies to the copies it makes for Telegram (see Security notes). |
+| `/tg redact [on\|off]` · `/tg redact transcript [on\|off]` | | Control how much credential scrubbing the bridge applies to the copies it makes for Telegram (`/bash` output is scrubbed by default; the mirrored transcript is not). |
 
 ### Autocomplete: what to know
 
@@ -291,7 +293,7 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
 
 ```bash
 npm run typecheck                  # tsc, strict
-npm run smoke                      # 92 assertions against a fake pi + mock Telegram (offline)
+npm run smoke                      # 151 assertions against a fake pi + mock Telegram (offline)
 npm run live                       # real pi (rpc mode) + mock Telegram Bot API
 PI_TG_LIVE_SRC="$HOME/.pi/agent" PI_TG_LIVE_EXT=1 PI_TG_LIVE_MASK=1 \
   PI_TG_LIVE_OPEN_SESSION="<session.jsonl>" npm run live
@@ -308,67 +310,3 @@ npm run probe -- "<session.jsonl>" # narrow probe of resume/fork/tree taps
   (fork confirmation) do not hang the run. `PI_TG_LIVE_MASK=1` masks session titles and prompts in
   the console output; `PI_TG_LIVE_SESSIONS=1` also copies real session files.
 * Both suites create throwaway agent/session dirs, so they never touch your own `~/.pi/agent`.
-
-## Security notes
-
-Treat the bot token as the session itself: whoever holds it can read everything pi mirrors and make
-pi run things, including bash. Everything below exists to keep that circle small.
-
-**The token**
-
-* Stored in `~/.pi/agent/telegram.json`, created `0600` and re-chmod'ed on every read and write; keep
-  that file out of backups you share. If the machine is compromised, or the token reaches someone
-  else, revoke it with @BotFather (`/revoke`) — the bridge cannot rotate it for you.
-* The bridge registers the token as a known secret and strips it from everything it sends to
-  Telegram — answers, live drafts, error lines, file captions. An answer that quotes the token cannot
-  leak it back into the chat.
-* `TELEGRAM_API_ROOT` is refused unless it is `https` (loopback `http` is allowed for the offline
-  tests, which is why the tests can run without a network). The token travels inside the request
-  path, so pointing the client at someone else's host hands it over; a non-`api.telegram.org`
-  https host logs a warning on stderr.
-
-**Who may talk to the bridge**
-
-* Pairing is required. Codes are six digits from a CSPRNG and are shown to the operator in the pi
-  terminal only — the chat waiting for approval never sees its own code.
-* Five wrong codes rotate the code, cool that chat down for five minutes and tell the operator in
-  the pi terminal. Guessing is loud, not silent; the operator can still approve the rotated code.
-* Unknown chats get a strict reply budget (about four replies a minute). A stranger probing the bot
-  cannot burn the quota your own answers need.
-* Paired chats get about 60 messages a minute with bursts to 60, and see a visible “⏳ 너무 빨라요”
-  when they exceed it. A runaway script cannot outrun Telegram's per-bot quota.
-* A prompt longer than 12 000 characters is refused rather than dumped into the model; attachments
-  above 8 MB are never downloaded.
-* Keyboard buttons belong to the chat they were rendered into. A button copied into another paired
-  chat — or tapped by another member of a paired group — cannot switch your model, resume a foreign
-  session or unpair a chat: the tap is refused and the operator is told.
-* Revoking a chat revokes every button it was ever handed.
-
-**What leaves the machine**
-
-* Answers, tool summaries and `/bash` output are copied to Telegram's servers and then to your phone.
-  pi's own session file is untouched; this mirrors a copy.
-* Errors the bridge shows are always scrubbed of credential-shaped strings (bot tokens, `sk-…`,
-  `gpt-key-…`, `ghp_…`, `AKIA…`, JWTs, `Authorization:`/`api_key=` values, long opaque blobs), and
-  URLs in error text keep only their host. Providers quote the key that was used — the raw string
-  must not reach a phone. Redaction removes the credential, not the message: a line like
-  `Key limit exceeded: $0.00 of $0.00` still says what went wrong.
-* `/bash` output is scrubbed as well, because `curl -H "Authorization: …"` echoes the secret into
-  the log. `/tg redact off` gives you the literal output if you need it.
-* `/tg redact transcript on` additionally scrubs the mirrored transcript. Off by default: at
-  `/verbose 2` you asked for what the terminal shows.
-* `/export` counts credential-looking strings in the transcript it is about to send and says so in
-  the caption, so you notice before it sits in a chat you forgot about.
-
-**Risk you should still weigh**
-
-* Model output at any verbosity is exactly what pi would have shown you. Pattern scrubbing catches
-  credentials, not secrets written in prose — if the repo holds secrets, treat the Telegram thread
-  like the terminal.
-* A Telegram account is the identity here. Whoever can open a chat with your bot and knows a pairing
-  code becomes the operator. In a paired group, every member can use the buttons.
-* `telegram_send` gives the model a file upload channel to your phone, and `/bash` gives any paired
-  chat a shell. That is the product; it also means a prompt-injected model can copy secrets out of
-  your machine into a chat you forgot about. Attaches are announced in the pi terminal — watch it.
-* Telegram retains what you mirror. If a hosted mirror of your work is not acceptable, keep pi in
-  the terminal and leave the bridge off (`--telegram-off`).
