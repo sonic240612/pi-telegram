@@ -228,7 +228,10 @@ if (openSession && existsSync(openSession)) {
 	extraArgs.push("--no-session");
 }
 const skipPrompt = Boolean(openSession);
-const child = spawn(process.execPath, [piCli, "--mode", "rpc", "--offline", ...extraArgs, "-e", join(process.cwd(), "index.ts")], {
+// PI_TG_LIVE_ENTRY: load a different copy of the extension — the installed git clone, for example —
+// so the check proves the published tree boots and bridges, where module resolution differs from here.
+const entry = process.env.PI_TG_LIVE_ENTRY ?? join(process.cwd(), "index.ts");
+const child = spawn(process.execPath, [piCli, "--mode", "rpc", "--offline", ...extraArgs, "-e", entry], {
 	cwd: workDir,
 	env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, TELEGRAM_API_ROOT: apiRoot, PI_OFFLINE: "1" },
 	stdio: ["pipe", "pipe", "pipe"],
