@@ -180,6 +180,43 @@ const piPackageDir = dirname(dirname(fileURLToPath(import.meta.resolve("@earendi
 const piCli = join(piPackageDir, "dist", "bundle", "cli.js");
 
 const extraArgs = process.env.PI_TG_LIVE_EXT === "1" ? [] : ["--no-extensions"];
+/**
+ * PI_TG_LIVE_PKGS="pi-goal-x,rpiv": load the user's *installed* extensions next to ours, so the
+ * interop checks run against the real packages rather than against fixtures that imitate them.
+ * Ours is always skipped — the check already loads it with `-e`, and two bridges on one mock API
+ * would fight over the updates.
+ */
+const wantedPackages = (process.env.PI_TG_LIVE_PKGS ?? "").split(",").map((name) => name.trim()).filter(Boolean);
+if (srcAgent && wantedPackages.length) {
+	try {
+		const settings = JSON.parse(readFileSync(join(srcAgent, "settings.json"), "utf8")) as { packages?: string[] };
+		for (const spec of settings.packages ?? []) {
+			if (!wantedPackages.some((needle) => spec.includes(needle))) continue;
+			if (spec.includes("pi-telegram")) continue;
+			const dir = spec.startsWith("npm:")
+				? join(srcAgent, "npm", "node_modules", spec.slice(4))
+				: spec.startsWith("git:")
+					? join(srcAgent, "git", spec.slice(4).replace(/:/g, "/"))
+					: "";
+			if (!dir || !existsSync(join(dir, "package.json"))) {
+				console.log(`  --   PI_TG_LIVE_PKGS: cannot find an install for ${spec}`);
+				continue;
+			}
+			const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { pi?: { extensions?: string[] }; exports?: Record<string, string> | string };
+			const entries = (manifest.pi?.extensions ?? (typeof manifest.exports === "string" ? [manifest.exports] : Object.values(manifest.exports ?? {})))
+				.map((rel) => join(dir, rel))
+				.filter((path) => existsSync(path));
+			if (!entries.length) {
+				console.log(`  --   PI_TG_LIVE_PKGS: no extension entry found in ${spec}`);
+				continue;
+			}
+			for (const entry of entries) extraArgs.push("-e", entry);
+			console.log(`  --   loading installed package ${spec} (${entries.length} extension(s))`);
+		}
+	} catch (error) {
+		console.log(`  --   PI_TG_LIVE_PKGS: could not read the package list: ${String(error)}`);
+	}
+}
 const openSession = process.env.PI_TG_LIVE_OPEN_SESSION;
 if (openSession && existsSync(openSession)) {
 	const sessionDir = join(agentDir, "sessions", "live-check");
@@ -500,6 +537,34 @@ for (const [heading, expect] of [["fork", /fork|새 세션/i], ["tree", /이동 
 	check("bridge still works after the session churn", back, scrub(replies().slice(before).join(" | ")).slice(0, 200));
 }
 
+// Commands that belong to other installed extensions must still reach pi from a phone, and the
+// bridge must only add its own /tg goal on top of them.
+let goalPackageLoaded = false;
+{
+	const before = replies().length;
+	// The listing is paginated into buttons, so the names are only visible in the keyboard itself.
+	send(CHAT, "/commands goal");
+	await waitFor(() => replies().length > before, 20_000);
+	const listing = lastKeyboardInfo("pi commands").buttons.map((button) => button.text).join(" | ");
+	goalPackageLoaded = /goal-(direct|status|list|pause)/.test(listing);
+	if (!goalPackageLoaded) {
+		console.log("  --   pi-goal-x is not loaded in this pi — command/goal interop checks skipped");
+	} else {
+		check("another extension's commands reach the phone", /goal-direct/.test(listing) && /goal-list/.test(listing), scrub(listing).slice(0, 220));
+		const beforeGoal = replies().length;
+		send(CHAT, "/goal-list");
+		const forwarded = await waitFor(() => replies().slice(beforeGoal).length > 0, 20_000);
+		const goalWindow = replies().slice(beforeGoal).join(" | ");
+		check("a goal-x command typed on the phone is handed to pi", forwarded && /▶️/.test(goalWindow) && !/알려진 명령이 아니에요/.test(goalWindow), scrub(goalWindow).slice(0, 220));
+	}
+	// /tg goal is ours: either the goal this session knows, or an honest empty state.
+	const beforeTgGoal = replies().length;
+	send(CHAT, "/tg goal");
+	const cardArrived = await waitFor(() => replies().slice(beforeTgGoal).length > 0, 20_000);
+	const card = replies().slice(beforeTgGoal).join(" | ");
+	check("/tg goal answers with a card or an honest empty state", cardArrived && /🎯/.test(card) && !/❌|⚠️| failed:/.test(card), scrub(card).slice(0, 240));
+}
+
 // Attachments: photo download path, then an unsupported attachment type.
 sendPhoto(CHAT, "photo-1", "what do you see in this photo?");
 await sleep(1500);
@@ -538,6 +603,25 @@ if (!skipPrompt) {
 	check("a prompt pi cannot run still explains itself", /❌|⚠️/.test(outcome) || /pong/i.test(outcome), scrub(outcome).slice(0, 200));
 	check("model failures are reported in chat, not swallowed", !/❌/.test(outcome) || /Key limit|403|exceeded/i.test(outcome), scrub(outcome).slice(0, 200));
 	await sleep(2000);
+}
+
+if (goalPackageLoaded && process.env.PI_TG_LIVE_GOAL === "1") {
+	// The real interop proof: pi-goal-x puts its goal record in its tool results, and the bridge has
+	// to read that shape without knowing the extension. Needs a model, so it is opt-in.
+	const beforeGoalPrompt = replies().length;
+	send(CHAT, "Call the create_goal tool right now with the objective exactly: live-check goal for pi-telegram. Do not start working on it.");
+	const goalNewsArrived = await waitFor(() => replies().slice(beforeGoalPrompt).some((text) => /🎯 <b>goal<\/b>/.test(text)), 150_000);
+	const goalWindow = replies().slice(beforeGoalPrompt).join(" | ");
+	if (/No API key|Key limit|403|exceeded|not logged in/i.test(goalWindow)) {
+		console.log("  --   no usable provider — pi-goal-x interop check skipped");
+	} else {
+		check("pi-goal-x announces its goal to the phone by itself", goalNewsArrived, scrub(goalWindow).slice(0, 300));
+		const beforeCard = replies().length;
+		send(CHAT, "/tg goal");
+		const cardArrived = await waitFor(() => replies().slice(beforeCard).length > 0, 20_000);
+		const card = replies().slice(beforeCard).join(" | ");
+		check("/tg goal shows the objective pi-goal-x created", cardArrived && /live-check goal for pi-telegram/.test(card), scrub(card).slice(0, 300));
+	}
 }
 
 // Anything the bridge generates about a failure must be safe to read on a phone: provider errors

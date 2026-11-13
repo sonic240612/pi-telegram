@@ -331,6 +331,24 @@ let thinkingLevel = "medium";
 let sessionName: string | undefined = "smoke session";
 
 const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
+/**
+ * pi's extension event bus: string channels, JSON-safe payloads, no imports between extensions.
+ * `@juicesharp/rpiv-ask-user-question` publishes its questionnaires here, so the fake needs one too.
+ */
+const busHandlers = new Map<string, ((data: unknown) => void)[]>();
+const busLog: { channel: string; data: unknown }[] = [];
+const bus = {
+	emit(channel: string, data: unknown): void {
+		busLog.push({ channel, data });
+		for (const handler of busHandlers.get(channel) ?? []) handler(data);
+	},
+	on(channel: string, handler: (data: unknown) => void): () => void {
+		const list = busHandlers.get(channel) ?? [];
+		list.push(handler);
+		busHandlers.set(channel, list);
+		return () => busHandlers.set(channel, (busHandlers.get(channel) ?? []).filter((entry) => entry !== handler));
+	},
+};
 const commandHandlers = new Map<string, (args: string, ctx: unknown) => unknown>();
 const registeredTools: { name: string; parameters: unknown; execute: (...args: unknown[]) => unknown }[] = [];
 const registeredFlags = new Set<string>();
@@ -402,6 +420,7 @@ const ctx = {
 };
 
 const fakePi: Record<string, unknown> = {
+	events: bus,
 	on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
 		const list = handlers.get(name) ?? [];
 		list.push(handler);
@@ -1209,6 +1228,244 @@ const oversizedButtons = calls
 	.flatMap((call) => ((call.params.reply_markup as { inline_keyboard?: { text: string; callback_data?: string }[][] })?.inline_keyboard ?? []).flat())
 	.filter((button) => button.text.length > 64 || new TextEncoder().encode(button.callback_data ?? "").byteLength > 64);
 check("no keyboard button exceeds telegram's own limits", oversizedButtons.length === 0, JSON.stringify(oversizedButtons[0] ?? {}).slice(0, 160));
+
+// 21d. another extension asks the user something. `@juicesharp/rpiv-ask-user-question` renders its
+// questionnaire in the terminal and waits there, so a phone user is locked out of a run that is
+// blocked on their answer. The channels and payload shapes below are that package's published event
+// contract (rpiv:ask-user:*): nothing of its internals is imported or patched.
+const PHONE2 = 555000444;
+commandHandlers.get("telegram")?.(`add ${PHONE2}`, ctx);
+await sleep(150);
+
+/** The newest questionnaire card in a chat — send or edit — with its buttons. */
+function askCard(chatId: number): Call | undefined {
+	return textMessages("pi가 선택을 기다려요")
+		.filter((call) => Number(call.params.chat_id) === chatId)
+		.at(-1);
+}
+function askButtons(chatId: number): { text: string; callback_data: string }[] {
+	return keyboardOf(askCard(chatId)).flat();
+}
+function askButton(chatId: number, label: string): { text: string; callback_data: string } | undefined {
+	return askButtons(chatId).find((button) => button.text === label);
+}
+function askMessageId(chatId: number): number {
+	return Number(askCard(chatId)?.params.message_id ?? 0);
+}
+
+bus.emit("rpiv:ask-user:prompt", {
+	toolCallId: "tc-q1",
+	questions: [
+		{
+			question: "Which build should I run?",
+			header: "Build",
+			multiSelect: false,
+			options: [
+				{ label: "debug", description: "slow but noisy", hasPreview: false },
+				{ label: "release", description: "the normal one", hasPreview: false },
+				{ label: "skip the tests", description: "", hasPreview: true },
+			],
+		},
+		{
+			question: "Which targets?",
+			header: "Targets",
+			multiSelect: true,
+			options: [
+				{ label: "win", description: "", hasPreview: false },
+				{ label: "linux", description: "", hasPreview: false },
+			],
+		},
+	],
+});
+await waitFor("the other extension's questionnaire reaches the chats", () => textMessages("pi가 선택을 기다려요").length >= 2, 8000);
+const askCards = textMessages("pi가 선택을 기다려요").filter((call) => call.method === "sendMessage");
+check("a questionnaire from another extension is offered in every paired chat", askCards.length >= 2, `${askCards.length} cards`);
+check("the question keeps its text, its chip and its multi-select hint", /Which build should I run\?/.test(String(askCard(CHAT)?.params.text)) && String(askCard(CHAT)?.params.text).includes("Build") && String(askCard(CHAT)?.params.text).includes("여러 개 선택"), shapeText(String(askCard(CHAT)?.params.text ?? "")));
+check("every option is a button, plus a typed-answer escape hatch and 제출", askButtons(CHAT).map((button) => button.text).join("|") === "debug|release|skip the tests|✏️ 직접 입력 (1)|win|linux|✏️ 직접 입력 (2)|✅ 제출|✖️ 거절", askButtons(CHAT).map((button) => button.text).join("|"));
+check("a preview the phone cannot render is announced instead of dropped", String(askCard(CHAT)?.params.text).includes("미리보기 있음"), shapeText(String(askCard(CHAT)?.params.text ?? "")));
+
+// a chat that just sees the question must still be able to talk to pi: typed answers are opt-in
+const promptsBeforeAsk = userMessages.length;
+suppressRunStart = true;
+pushMessage(CHAT, "일반 메시지 — 질문이 열려 있어도 pi에게 가요");
+await waitFor("plain message still reaches pi while a question is open", () => userMessages.length > promptsBeforeAsk, 8000);
+check("an open questionnaire never hijacks ordinary messages", promptText().includes("일반 메시지"));
+suppressRunStart = false;
+
+pushCallback(CHAT, askMessageId(CHAT), askButton(CHAT, "debug")!.callback_data);
+await waitFor("single choice held until 제출", () => String(askCard(CHAT)?.params.text).includes("✅ <b>debug</b>"), 8000);
+check("a single-select choice is remembered on the card", true);
+for (const target of ["win", "linux"]) {
+	const token = askButton(CHAT, target)?.callback_data;
+	if (token) pushCallback(CHAT, askMessageId(CHAT), token);
+	// a rerender hands out new tokens, so the next tap must come from the refreshed card
+	await waitFor(`the card shows ${target} checked`, () => askButtons(CHAT).some((button) => button.text === `✓ ${target}`), 8000);
+}
+check("a multi-select question accumulates both picks", String(askCard(CHAT)?.params.text).includes("✅ <b>win</b>") && String(askCard(CHAT)?.params.text).includes("✅ <b>linux</b>"), shapeText(String(askCard(CHAT)?.params.text ?? "")));
+
+const typeButton = askButton(CHAT, "✏️ 직접 입력 (2)");
+pushCallback(CHAT, askMessageId(CHAT), typeButton!.callback_data);
+await waitFor("typed-answer mode armed", () => askButtons(CHAT).some((button) => button.text.includes("지금 답 입력 중")), 8000);
+const promptsBeforeTyped = userMessages.length;
+pushMessage(CHAT, "linux 말고 docker");
+await waitFor("typed answer consumed by the questionnaire", () => String(askCard(CHAT)?.params.text).includes("docker"), 8000);
+check("a typed answer in ✏️ mode is an answer, not a prompt to pi", userMessages.length === promptsBeforeTyped && !promptText().includes("linux 말고 docker"), `+${userMessages.length - promptsBeforeTyped} prompts`);
+
+pushCallback(CHAT, askMessageId(CHAT), askButton(CHAT, "✅ 제출")!.callback_data);
+await waitFor("the answer goes back on the other extension's channel", () => busLog.some((entry) => entry.channel === "rpiv:ask-user:answer"), 8000);
+const askAnswer = busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").at(-1)?.data as {
+	toolCallId?: string;
+	answers?: { questionIndex: number; optionIndexes?: number[]; text?: string }[];
+};
+check("the answer names the questionnaire it belongs to", askAnswer?.toolCallId === "tc-q1", JSON.stringify(askAnswer ?? {}).slice(0, 160));
+check(
+	"the answer matches the shape that package validates",
+	JSON.stringify(askAnswer?.answers) === JSON.stringify([{ questionIndex: 0, optionIndexes: [0] }, { questionIndex: 1, optionIndexes: [0, 1], text: "linux 말고 docker" }]),
+	JSON.stringify(askAnswer?.answers ?? null),
+);
+await waitFor("every chat is told the question is answered", () => textMessages("답변을 pi에 전달했어요").length >= 2, 8000);
+check("answering in one chat closes the card in the others", true);
+const staleAskTaps = askButtons(CHAT);
+check("the answered card loses its buttons", staleAskTaps.length === 0, `${staleAskTaps.length} left`);
+
+// a stolen token is useless: the card in the other chat carries its own tokens
+bus.emit("rpiv:ask-user:prompt", { toolCallId: "tc-q2", questions: [{ question: "One more thing", header: "More", multiSelect: false, options: [{ label: "yes", description: "", hasPreview: false }, { label: "no", description: "", hasPreview: false }] }] });
+await waitFor("second questionnaire rendered", () => askButtons(PHONE2).some((button) => button.text === "yes"), 8000);
+const foreignToken = askButton(CHAT, "yes")!.callback_data;
+check("each chat gets its own buttons for the same question", foreignToken !== askButton(PHONE2, "yes")!.callback_data);
+pushCallback(PHONE2, askMessageId(PHONE2), foreignToken);
+await waitFor("borrowed questionnaire tap refused", () => calls.some((call) => call.method === "answerCallbackQuery" && String(call.params.text).includes("다른 채팅")), 8000);
+check("answering another chat's questionnaire button is refused", busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").length === 1, JSON.stringify(busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").map((entry) => (entry.data as { toolCallId?: string }).toolCallId)));
+pushCallback(PHONE2, askMessageId(PHONE2), askButton(PHONE2, "no")!.callback_data);
+await waitFor("single question answered by one tap", () => busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").length === 2, 8000);
+const secondAnswer = busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").at(-1)?.data as { toolCallId?: string; answers?: { optionIndexes?: number[] }[] };
+check("a one-question single-select is settled by a single tap", secondAnswer?.toolCallId === "tc-q2" && secondAnswer.answers?.[0]?.optionIndexes?.[0] === 1, JSON.stringify(secondAnswer ?? null).slice(0, 160));
+
+// the package clears its own blocked flag when the terminal answers first
+bus.emit("rpiv:ask-user:prompt", { toolCallId: "tc-q3", questions: [{ question: "아직 열려 있어요", header: "Open", multiSelect: false, options: [{ label: "a", description: "", hasPreview: false }] }] });
+await waitFor("third questionnaire rendered", () => askButtons(CHAT).some((button) => button.text === "a"), 8000);
+const closedAskButtons = askButtons(CHAT);
+bus.emit("rpiv:ask-user:blocked", { active: false, toolCallId: "tc-q3" });
+await waitFor("the chat learns the question closed", () => textMessages("질문이 닫혔어요").length > 0, 8000);
+check("a question answered in the terminal is closed on the phone too", true);
+pushCallback(CHAT, askMessageId(CHAT), closedAskButtons[0]?.callback_data ?? "t:none");
+await waitFor("tapping a closed question is refused", () => calls.some((call) => call.method === "answerCallbackQuery" && String(call.params.text).includes("만료됐어요")), 8000);
+check("buttons of a closed questionnaire do nothing", !busLog.some((entry) => entry.channel === "rpiv:ask-user:answer" && (entry.data as { toolCallId?: string }).toolCallId === "tc-q3"));
+
+// pi can refuse the answer we send; that must be visible on the phone, not swallowed
+bus.emit("rpiv:ask-user:prompt", { toolCallId: "tc-q4", questions: [{ question: "거부되는 답변", header: "Reject", multiSelect: false, options: [{ label: "yes", description: "", hasPreview: false }] }] });
+await waitFor("fourth questionnaire rendered", () => askButtons(CHAT).some((button) => button.text === "yes"), 8000);
+pushCallback(CHAT, askMessageId(CHAT), askButton(CHAT, "yes")!.callback_data);
+await waitFor("fourth answer emitted", () => busLog.filter((entry) => entry.channel === "rpiv:ask-user:answer").length === 3, 8000);
+bus.emit("rpiv:ask-user:answer-result", { ok: false, code: "unsupported_host", reason: "this host answers in its own dialogs", toolCallId: "tc-q4" });
+await waitFor("a refused answer is announced", () => textMessages("pi 터미널에서 답해야 해요").length > 0, 8000);
+check("a rejected answer tells the user where to answer", true);
+
+// payloads off the bus belong to someone else, so malformed ones must not take the bridge down
+const noticesBeforeMalformed = notices.length;
+bus.emit("rpiv:ask-user:prompt", { toolCallId: "tc-bad", questions: [{}, { question: "   ", options: [null] }, "junk"] });
+bus.emit("rpiv:ask-user:prompt", { questions: [{ question: "id 없음", header: "x", multiSelect: false, options: [{ label: "a", description: "", hasPreview: false }] }] });
+await sleep(400);
+check("a questionnaire with no usable content is refused, not rendered", !textMessages("id 없음").length && !textMessages("질문 없음").length);
+check("a malformed questionnaire is reported in the terminal", notices.length >= noticesBeforeMalformed + 2, `${notices.length - noticesBeforeMalformed} notices: ${notices.slice(-2).map((entry) => entry.message).join(" | ")}`);
+bus.emit("rpiv:ask-user:blocked", { active: false });
+bus.emit("rpiv:ask-user:answer-result", { ok: false, code: "not_found", toolCallId: "tc-never-opened" });
+await sleep(300);
+pushMessage(CHAT, "/ping");
+await waitFor("bridge survives malformed interop payloads", () => textMessages("pong").some((call) => Number(call.params.chat_id) === CHAT), 8000);
+check("the bridge still answers after junk off the bus", true);
+
+// 21e. goal-driven runs (`pi-goal-x`): pi chases an objective unattended, so the phone needs the
+// objective, the progress and the state changes without opening the terminal. Its own /goal command
+// is left alone; `/tg goal` is the phone-side view of the same record.
+pushMessage(CHAT, "/verbose 1");
+await waitFor("detail 1", () => textMessages("detail 1").some((call) => Number(call.params.chat_id) === CHAT), 8000);
+const noGoal = textMessages("🎯 <b>goal</b>").length;
+pushMessage(CHAT, "/tg goal");
+await waitFor("/tg goal without a goal", () => textMessages("🎯 <b>goal</b>").length > noGoal, 8000);
+check("/tg goal says there is no goal instead of failing", /추적 중인 goal이 없어요/.test(lastTextFor(CHAT)), shapeText(lastTextFor(CHAT)));
+
+const goalRecord = (status: string, done: number, tokensUsed: number, extra: Record<string, unknown> = {}) => ({
+	id: "goal-7",
+	objective: "pi-telegram에 컨텍스트 압축 알림 넣기",
+	status,
+	autoContinue: true,
+	usage: { tokensUsed, activeSeconds: 142 },
+	taskList: { tasks: Array.from({ length: 3 }, (_unused, index) => ({ status: index < done ? "complete" : "pending" })) },
+	createdAt: "2026-01-01T00:00:00.000Z",
+	updatedAt: "2026-01-01T00:05:00.000Z",
+	...extra,
+});
+const goalResult = (goal: unknown) => ({ content: [{ type: "text", text: "goal updated" }], details: { goal } });
+const goalLines = (chatId: number = CHAT) => textMessages("🎯 <b>goal</b>").filter((call) => Number(call.params.chat_id) === chatId);
+/** Waits are always scoped to one chat: a broadcast lands in the paired chats a moment apart. */
+const goalLineSeen = (needle: string, chatId: number = CHAT) => textMessages(needle).some((call) => Number(call.params.chat_id) === chatId);
+/**
+ * Counted by distinct text: session replacement (section 21) leaves more than one mirror attached to
+ * this fake pi, so one logical announcement can land in a chat twice. That duplication is a harness
+ * artefact, not something the goal view does.
+ */
+const goalNewsTexts = () => new Set(goalLines().map((call) => String(call.params.text)));
+const extraGoalNews = (since: number) => [...goalNewsTexts()].slice(since).map(shapeText).join(" | ");
+emit("tool_execution_end", {
+	type: "tool_execution_end",
+	toolCallId: "g1",
+	toolName: "update_goal",
+	result: goalResult(goalRecord("active", 1, 5_123)),
+	isError: false,
+});
+await waitFor("the goal is announced in the chat", () => goalLineSeen("goal</b> <i>(시작)</i>"), 8000);
+const goalNews = textMessages("🎯 <b>goal</b> <i>(시작)</i>").filter((call) => Number(call.params.chat_id) === CHAT).at(-1)!;
+check("a goal started by another extension shows up on the phone", String(goalNews.params.text).includes("pi-telegram에 컨텍스트 압축 알림 넣기") && String(goalNews.params.text).includes("1/3") && String(goalNews.params.text).includes("▶️ active"), shapeText(String(goalNews.params.text)));
+check("the goal line carries the tokens and the elapsed time", String(goalNews.params.text).includes("5.12k tok") && String(goalNews.params.text).includes("2m 22s"), shapeText(String(goalNews.params.text)));
+await waitFor("the goal line reaches every paired chat", () => goalLines(PHONE2).length > 0, 8000);
+check("a goal line is broadcast, not just sent to the chat that started it", goalLines(PHONE2).length >= 1);
+const goalLinesBefore = goalNewsTexts().size;
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "g2", toolName: "update_goal", result: goalResult(goalRecord("active", 2, 7_900)), isError: false });
+await sleep(500);
+check("task bookkeeping inside the throttle window does not spam the chat", goalNewsTexts().size === goalLinesBefore, extraGoalNews(goalLinesBefore));
+
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "g3", toolName: "update_goal", result: goalResult(goalRecord("paused", 2, 7_900, { pauseReason: "provider가 429를 돌려줬어요", pauseSuggestedAction: "/goal-resume for to retry" })), isError: false });
+await waitFor("a paused goal is announced", () => goalLineSeen("goal</b> <i>(상태 변경)</i>"), 8000);
+const pausedNews = textMessages("goal</b> <i>(상태 변경)</i>").filter((call) => Number(call.params.chat_id) === CHAT).at(-1)!;
+check("a goal that stops tells the phone why", String(pausedNews.params.text).includes("provider가 429") && String(pausedNews.params.text).includes("⏸️ paused"), shapeText(String(pausedNews.params.text)));
+
+pushMessage(CHAT, "/tg goal");
+await waitFor("/tg goal card", () => textMessages("중단 사유").some((call) => call.method === "sendMessage" && Number(call.params.chat_id) === CHAT), 8000);
+const goalCard = textMessages("중단 사유").filter((call) => call.method === "sendMessage").at(-1)!;
+check("/tg goal shows objective, state, usage and the reason it stopped", String(goalCard.params.text).includes("pi-telegram에 컨텍스트 압축 알림 넣기") && String(goalCard.params.text).includes("작업 2/3") && String(goalCard.params.text).includes("7.90k tokens") && String(goalCard.params.text).includes("provider가 429"), shapeText(String(goalCard.params.text)));
+pushMessage(CHAT, "/status");
+await waitFor("/status shows the goal line", () => textMessages("goal").some((call) => call.method === "sendMessage" && Number(call.params.chat_id) === CHAT && /goal.*goal-7/s.test(String(call.params.text))), 8000);
+check("/status keeps a compact goal line", true);
+
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "g4", toolName: "update_goal", result: goalResult(goalRecord("complete", 3, 12_400)), isError: false });
+await waitFor("a finished goal is announced", () => goalLines().some((call) => String(call.params.text).includes("✅ complete")), 8000);
+await sleep(400); // mirrors still attached from the session-replacement section land a moment apart
+check("a finished goal is announced as finished", goalLines().some((call) => String(call.params.text).includes("✅ complete")), goalLines().map((call) => shapeText(String(call.params.text))).join(" | "));
+const goalLinesAfterFinish = goalNewsTexts().size;
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "g5", toolName: "update_goal", result: goalResult(goalRecord("complete", 3, 13_900)), isError: false });
+await sleep(500);
+check("an unchanged goal is not announced twice", goalNewsTexts().size === goalLinesAfterFinish, extraGoalNews(goalLinesAfterFinish));
+
+pushMessage(CHAT, "/verbose 0");
+await waitFor("detail 0", () => textMessages("detail 0").some((call) => Number(call.params.chat_id) === CHAT), 8000);
+
+// a goal has to survive /resume: the state is read off the session record, and re-reading it must
+// not spam a chat that already watched it happen.
+const { GoalView } = await import("../src/goal.ts");
+const revived = new GoalView();
+const restored = revived.restore([
+	{ type: "message", message: { role: "toolResult", toolName: "create_goal", details: { goal: goalRecord("active", 1, 100) } } },
+	{ type: "custom", customType: "pi-goal-focus", data: { focusedGoalId: "goal-7", reason: "created", storageRoot: "/tmp/goals" } },
+]);
+check("a resumed session still knows its goal", restored?.id === "goal-7" && revived.focusState()?.goalId === "goal-7", JSON.stringify({ restored, focus: revived.focusState() }).slice(0, 200));
+check("restoring a goal does not re-announce it", revived.observeToolResult({ details: { goal: goalRecord("active", 1, 100) } }) === undefined && revived.current()?.id === "goal-7");
+check("a tool result with no goal in it is not mistaken for one", revived.observeToolResult({ content: [{ type: "text", text: "just a file" }], details: { path: "/tmp/x" } }) === undefined);
+// pi-goal-x used to persist the whole record in a `pi-goal-state` entry; a session written by such a
+// release is old, but the goal on it is still worth showing.
+const legacy = new GoalView().restore([{ type: "custom", customType: "pi-goal-state", data: { version: 3, goal: goalRecord("paused", 1, 2_000) } }]);
+check("a goal from an older pi-goal-x session is still readable", legacy?.id === "goal-7" && legacy.status === "paused" && legacy.tokensUsed === 2_000, JSON.stringify(legacy ?? null).slice(0, 160));
+check("an unreadable goal record is ignored, not thrown", new GoalView().restore([{ type: "custom", customType: "pi-goal-state", data: { goal: { id: 17 } } }]) === undefined);
 
 // 21c. security: credentials, floods, stolen keyboards, untrusted input
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";

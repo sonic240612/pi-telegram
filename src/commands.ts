@@ -8,6 +8,7 @@
  */
 import type { CallbackActionKind, CallbackEntry, CallbackResult, Hub, ListSpec, SendOptions } from "./hub.ts";
 import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, tgDebug, truncate } from "./format.ts";
+import { goalCardHtml, goalStatusLabel } from "./goal.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface CommandInvocation {
@@ -183,7 +184,7 @@ export class CommandLayer {
 			["모델·도구", "/model [이름·검색어] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<이름>]"],
 			["실행 제어", "/abort · /steer <메시지> · /queue <메시지> · /bash <셸 명령>"],
 			["상태·표시", "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact"],
+			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact|goal"],
 		];
 		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
 		const notes = [
@@ -233,6 +234,14 @@ export class CommandLayer {
 			`tools ${inlineCode(active.join(", ") || "none")}`,
 			`detail ${inlineCode(String(this.hub.verbosity()))} · drafts ${inlineCode(this.hub.cfg.streaming ? "on" : "off")} · ${inlineCode(this.hub.isIdle() ? "idle" : "running")}`,
 		];
+		const goal = this.hub.goalState().goal;
+		// A goal is the one thing /status cannot show from pi's own state, and the one thing a phone
+		// user most needs to see while pi runs unattended.
+		if (goal) {
+			lines.push(
+				`goal ${goalStatusLabel(goal.status)} ${inlineCode(truncate(goal.id, 24))}${goal.tasksTotal ? ` · ${goal.tasksDone}/${goal.tasksTotal}` : ""} · ${formatCount(goal.tokensUsed)} tok <i>(/tg goal)</i>`,
+			);
+		}
 		await this.say(chatId, lines.join("\n"));
 	}
 
@@ -536,8 +545,13 @@ export class CommandLayer {
 				return this.tgStats(chatId);
 			case "menu":
 				return this.tgMenu(chatId);
+			case "goal": {
+				// pi-goal-x owns /goal; the phone-side view of the same state lives here.
+				const state = this.hub.goalState();
+				return this.say(chatId, goalCardHtml(state.goal, state.focus));
+			}
 			default:
-				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact")}`);
+				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact|goal")}`);
 		}
 	}
 

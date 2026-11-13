@@ -133,6 +133,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tg stats` (alias `/tg latency`) | — | Telegram call count / average / max, poll count, slow calls, 429s, and prompt → run-start delay. Tells you whether a slow reply is pi thinking or the network. |
 | `/tg menu` | — | Re-register the “/” autocomplete menu and verify what Telegram serves. Use it when the autocomplete list looks wrong (see below). |
 | `/tg redact [on\|off]` · `/tg redact transcript [on\|off]` | | Control how much credential scrubbing the bridge applies to the copies it makes for Telegram (`/bash` output is scrubbed by default; the mirrored transcript is not). |
+| `/tg goal` | — | The goal this session is chasing, as another extension (`pi-goal-x`) records it: state, task count, tokens, why it paused. Also a compact goal line in `/status`. |
 
 ### Autocomplete: what to know
 
@@ -155,6 +156,24 @@ Any other `/name` is handed to pi, so these all work from Telegram:
 
 Terminal-only commands (`/settings`, `/import`, `/hotkeys`, `/clone`, `/trust`, `/login`, …) reply with
 a hint instead of being silently dropped.
+
+### Questionnaires and goals from other extensions
+
+Two installed extensions are bridged rather than reimplemented — the bridge only reads what they put
+on pi's event bus and session record, so a rename inside them degrades a feature instead of breaking
+the bridge:
+
+* **`@juicesharp/rpiv-ask-user-question`** (`ask_user_question`): when pi asks that questionnaire, the
+  questions arrive in *every* paired chat as buttons — single-select answers on the first tap,
+  multi-select accumulates ticks and submits with ✅, and ✏️ lets the next message be a typed answer.
+  The first chat to answer wins; the cards in the other chats close. An answer typed in the terminal
+  closes the phone cards too. In hosts where that package answers through the host's own dialogs
+  (RPC/ACP clients such as Zed), the phone cannot answer and says so instead of hanging.
+* **`pi-goal-x`**: its goal is shown with `/tg goal` and as a line in `/status`, and state changes
+  (new goal, paused, blocked, task progress) are announced in the chats at verbosity ≥ 1 — throttled,
+  so a long task bookkeeping run does not become chat spam. The goal's own commands (`/goal`,
+  `/goal-pause`, …) stay pi-goal-x's; the bridge adds no `/goal` of its own, and its confirmation
+  dialogs appear in the terminal, so run the confirming ones there.
 
 ### In pi (terminal) rather than Telegram
 

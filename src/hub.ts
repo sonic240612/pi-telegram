@@ -4,6 +4,7 @@
  */
 import type { ContextUsage, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TelegramConfig } from "./config.ts";
+import type { GoalSnapshot, FocusState } from "./goal.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface SendOptions {
@@ -28,6 +29,11 @@ export type CallbackActionKind =
 	| "menu:open"
 	| "chat:unpair"
 	| "ask:answer"
+	| "askq:option"
+	| "askq:multi"
+	| "askq:text"
+	| "askq:submit"
+	| "askq:cancel"
 	| "noop";
 
 export interface CallbackAction {
@@ -121,11 +127,16 @@ export interface Hub {
 
 	chats(): number[];
 	labelFor(chatId: number): string;
-	send(chatId: number, text: string, options?: SendOptions): Promise<void>;
+	/** Send a message; resolves to the telegram message id when one exists (needed to edit it later). */
+	send(chatId: number, text: string, options?: SendOptions): Promise<number | undefined>;
 	broadcast(text: string, options?: SendOptions): Promise<void>;
 	sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: string): Promise<void>;
 	broadcastFile(data: Uint8Array, fileName: string, caption?: string): Promise<void>;
 	editKeyboard(chatId: number, messageId: number, text: string, rows: TgInlineKeyboardButton[][]): Promise<boolean>;
+	/** Take the buttons off a message we no longer have actions for. */
+	clearKeyboard(chatId: number, messageId: number): Promise<void>;
+	/** A line for the pi operator's terminal — chat-side events worth seeing at the keyboard. */
+	notify(text: string, level?: "info" | "warning"): void;
 
 	// pi-side actions, implemented by the bridge
 	piContext(): ExtensionContext;
@@ -167,6 +178,13 @@ export interface Hub {
 	listTreeEntries(limit: number): { entryId: string; label: string; timestamp: string; current: boolean }[];
 	runShell(command: string, timeoutMs?: number): Promise<ShellResult>;
 	sessionFilePath(): string | undefined;
+	/**
+	 * Fold a tool result into the goal view (pi-goal-x interop). Returns chat HTML when the change is
+	 * news — a new goal, a status change, or task progress — and nothing for bookkeeping mutations.
+	 */
+	observeGoal(result: unknown): string | undefined;
+	/** What the bridge knows about the goal this session is chasing. */
+	goalState(): { goal?: GoalSnapshot; focus?: FocusState };
 	uptimeMs(): number;
 	botName(): string;
 	modelId(): string | undefined;

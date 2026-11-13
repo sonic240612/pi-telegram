@@ -10,6 +10,8 @@ import { Type } from "typebox";
 import { loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
+import { GoalView, type FocusState, type GoalSnapshot } from "./goal.ts";
+import { QuestionnaireBridge, type EventBusLike } from "./questions.ts";
 import { escapeHtml, formatBytes, formatCount, redactSecrets, registerSecret, scrubKnownSecrets, splitLongLine, tgDebug, toHtmlChunks, truncate } from "./format.ts";
 import type { CallbackAction, CallbackEntry, Hub, ModelLike, SendOptions, ShellResult, SessionInfoLike } from "./hub.ts";
 import { CALLBACK_PREFIX, stripCallbackPrefix } from "./hub.ts";
@@ -71,6 +73,12 @@ export class TelegramBridge implements Hub {
 	private readonly drafts: DraftManager;
 	private readonly commands: CommandLayer;
 	private readonly mirror: OutboundMirror;
+	/** Questionnaires other extensions ask (rpiv-ask-user-question), mirrored into the chats. */
+	private readonly questions: QuestionnaireBridge;
+	/** What pi-goal-x is chasing, read off the session record. */
+	private readonly goalView = new GoalView();
+	/** A dialog only pi's terminal can answer — worth saying out loud instead of going quiet. */
+	private waitingOnTerminal: { kind: string; title?: string; timer?: ReturnType<typeof setTimeout> } | undefined;
 
 	private pollAbort?: AbortController;
 	private pollLoop?: Promise<void>;
@@ -132,6 +140,7 @@ export class TelegramBridge implements Hub {
 		this.drafts = new DraftManager(() => this.bot);
 		this.commands = new CommandLayer(this);
 		this.mirror = new OutboundMirror(this, this.drafts);
+		this.questions = new QuestionnaireBridge(this);
 	}
 
 	/** Debug lines are tagged per bridge instance: replacement leaves more than one alive. */
@@ -143,12 +152,17 @@ export class TelegramBridge implements Hub {
 
 	install(): void {
 		this.mirror.register(this.pi);
+		// pi's extension event bus is how another extension's questionnaire reaches us without touching it.
+		const bus = (this.pi as unknown as { events?: EventBusLike }).events;
+		if (bus && typeof bus.on === "function" && typeof bus.emit === "function") this.questions.register(bus);
+		else this.dbg("no extension event bus — ask-user-question bridging is off");
 		this.registerPiCommands();
 		this.registerTools();
 		this.captureContext();
 		this.pi.on("session_start", (_event, ctx) => {
 			this.dbg("session_start");
 			this.eventCtx = ctx;
+			this.restoreGoal(ctx);
 			this.refreshStatus();
 			// a shutdown for the previous session may still be unwinding; reconnect once it has settled
 			if (this.stopping) {
@@ -202,6 +216,51 @@ export class TelegramBridge implements Hub {
 		this.pi.on("session_info_changed", remember);
 		this.pi.on("session_tree", remember);
 		this.pi.on("agent_end", remember);
+		// Extensions that block on pi's terminal dialogs leave a phone user staring at silence; say so.
+		this.pi.on("ui_prompt_start", (event) => this.noteTerminalDialog(event));
+		this.pi.on("ui_prompt_end", () => this.clearTerminalDialog());
+	}
+
+	/**
+	 * pi-goal-x keeps its goal record in its own files, but the task tools hand that record back in
+	 * their tool-result `details` and its focus entry rides the session — both are ours to read, so a
+	 * fresh bridge after /resume or /fork still knows what the session is chasing.
+	 */
+	private restoreGoal(ctx: ExtensionContext): void {
+		try {
+			const goal = this.goalView.restore(ctx.sessionManager.getBranch());
+			this.dbg("goal restore", goal ? `${goal.id} ${goal.status}` : "none");
+		} catch (error) {
+			this.dbg("goal restore failed", error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	/**
+	 * An extension dialog rendered in pi's terminal (select/confirm/input/editor/custom) has no
+	 * Telegram equivalent unless the extension publishes it — so the run just goes quiet. Say what is
+	 * waiting instead. Delayed on purpose: a questionnaire that arrives on the bus a moment later
+	 * renders proper buttons, and two notices for one wait would be noise.
+	 */
+	private noteTerminalDialog(event: { kind: string; title?: string }): void {
+		this.clearTerminalDialog();
+		if (this.questions.openCount() > 0) return;
+		const waiting = { kind: event.kind, ...(event.title ? { title: event.title } : {}) };
+		this.waitingOnTerminal = waiting;
+		const timer = setTimeout(() => {
+			if (!this.waitingOnTerminal || this.waitingOnTerminal !== waiting) return;
+			if (this.questions.openCount() > 0 || this.cfg.verbosity < 1) return;
+			void this.broadcast(
+				`⏸️ <i>pi가 터미널에서 답을 기다려요 (${escapeHtml(waiting.kind)}${waiting.title ? ` · ${escapeHtml(truncate(waiting.title, 80))}` : ""}) — 이 대화상자는 pi 앞에서 답해야 해요.</i>`,
+				{ markdown: false },
+			).catch(() => undefined);
+		}, 1500);
+		timer.unref?.();
+		this.waitingOnTerminal = { ...waiting, timer };
+	}
+
+	private clearTerminalDialog(): void {
+		if (this.waitingOnTerminal?.timer) clearTimeout(this.waitingOnTerminal.timer);
+		this.waitingOnTerminal = undefined;
 	}
 
 	private registerPiCommands(): void {
@@ -523,6 +582,9 @@ export class TelegramBridge implements Hub {
 	private async stopInner(reason?: string, silent = false): Promise<void> {
 		this.dbg("stop", reason, "silent:", silent, "replaced:", this.replacedSession);
 		this.clearPromptWatch("bridge stopped");
+		this.clearTerminalDialog();
+		// A questionnaire belonged to this session; leave dead buttons in the chats and they invite taps.
+		this.questions.closeAll("pi 세션이 끝나면서 질문도 닫혔어요.");
 		this.pollAbort?.abort();
 		const loop = this.pollLoop;
 		this.pollLoop = undefined;
@@ -715,6 +777,11 @@ export class TelegramBridge implements Hub {
 			} catch (error) {
 				await this.sendHtml(chatId, `⚠️ /${escapeHtml(command)} 실패: ${escapeHtml(errorMessage(error))}`);
 			}
+			return;
+		}
+		// A chat sitting in ✏️ mode is answering somebody else's questionnaire, not prompting pi.
+		if (await this.questions.consumeText(chatId, text)) {
+			this.dbg("typed answer captured", chatId);
 			return;
 		}
 		await this.deliverToPi(chatId, message, text);
@@ -1008,6 +1075,15 @@ export class TelegramBridge implements Hub {
 			return;
 		}
 		try {
+			if (entry.action.kind.startsWith("askq:")) {
+				// A questionnaire another extension asked: whoever taps first answers it, and the
+				// keyboards in the other chats close once one answer landed.
+				const result = await this.questions.handleCallback(chatId, query.message?.message_id, entry);
+				await this.bot?.answerCallbackQuery(query.id, result.toast || undefined, result.showAlert);
+				if (result.keep) this.keepToken(token);
+				else this.dropToken(token);
+				return;
+			}
 			const result = await this.commands.handleCallback(chatId, query.message?.message_id, entry);
 			await this.bot?.answerCallbackQuery(query.id, result.toast || undefined, result.showAlert);
 			if (result.keep) this.keepToken(token);
@@ -1020,7 +1096,7 @@ export class TelegramBridge implements Hub {
 
 	// ------------------------------------------------------------- Hub: out
 
-	async send(chatId: number, text: string, options: SendOptions = {}): Promise<void> {
+	async send(chatId: number, text: string, options: SendOptions = {}): Promise<number | undefined> {
 		if (!this.bot) throw new Error("telegram bridge is not running");
 		// Exact known secrets (our own bot token above all) never ride along, whoever authored the text.
 		if (this.cfg.redactTranscript) text = redactSecrets(text);
@@ -1031,11 +1107,19 @@ export class TelegramBridge implements Hub {
 			...(options.replyToMessageId ? { reply_to_message_id: options.replyToMessageId } : {}),
 			...(options.silent ? { disable_notification: true } : {}),
 		};
+		let firstId: number | undefined;
 		if (options.markdown === false) {
-			for (const piece of splitHtmlChunks(text, 4000)) await this.bot.sendSafe(chatId, piece, base);
-			return;
+			for (const piece of splitHtmlChunks(text, 4000)) {
+				const sent = await this.bot.sendSafe(chatId, piece, base);
+				firstId ??= sent?.message_id;
+			}
+			return firstId;
 		}
-		for (const chunk of toHtmlChunks(text)) await this.bot.sendSafe(chatId, chunk, base);
+		for (const chunk of toHtmlChunks(text)) {
+			const sent = await this.bot.sendSafe(chatId, chunk, base);
+			firstId ??= sent?.message_id;
+		}
+		return firstId;
 	}
 
 	/** Send text that already contains Telegram HTML. */
@@ -1074,6 +1158,25 @@ export class TelegramBridge implements Hub {
 	async editKeyboard(chatId: number, messageId: number, text: string, rows: TgInlineKeyboardButton[][]): Promise<boolean> {
 		if (!this.bot) return false;
 		return this.bot.editSafe(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+	}
+
+	async clearKeyboard(chatId: number, messageId: number): Promise<void> {
+		if (!this.bot) return;
+		await this.bot.clearKeyboard(chatId, messageId);
+	}
+
+	notify(text: string, level: "info" | "warning" = "info"): void {
+		this.eventCtx?.ui.notify(text, level);
+	}
+
+	observeGoal(result: unknown): string | undefined {
+		return this.goalView.observeToolResult(result);
+	}
+
+	goalState(): { goal?: GoalSnapshot; focus?: FocusState } {
+		const goal = this.goalView.current();
+		const focus = this.goalView.focusState();
+		return { ...(goal ? { goal } : {}), ...(focus ? { focus } : {}) };
 	}
 
 	// -------------------------------------------------------------- Hub: pi
@@ -1536,6 +1639,7 @@ export class TelegramBridge implements Hub {
 		if (this.cfg.chats.length === before) return false;
 		// Revoke every button that chat was ever handed, or a revoked chat keeps live controls.
 		for (const [token, entry] of this.tokens) if (entry.chatId === chatId) this.tokens.delete(token);
+		this.questions.dropChat(chatId);
 		this.drafts.discard(chatId);
 		writeConfigNow(this.cfg);
 		return true;

@@ -267,6 +267,11 @@ export class OutboundMirror {
 		parentToolCallId?: string,
 	): Promise<void> {
 		if (parentToolCallId) return;
+		// A goal-driven run (pi-goal-x) keeps its state in the tool results of its own task tools.
+		// Fold it in here, and send any news through this same queue so a goal line cannot overtake
+		// the answer it belongs to.
+		const goalNews = this.hub.observeGoal(result);
+		if (goalNews && this.verbosity() >= 1) await this.sendHtmlAll(goalNews);
 		const notes = this.noteRefs.get(toolCallId);
 		this.noteRefs.delete(toolCallId);
 		const detail = notes?.[0]?.detail ?? summarizeToolCall(toolName, undefined);
