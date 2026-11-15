@@ -189,7 +189,7 @@ export class CommandLayer {
 		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
 		const notes = [
 			"",
-			"<i>일반 텍스트는 그대로 pi 프롬프트, 이미지·PDF·코드 파일은 첨부로 전달돼요.</i>",
+			"<i>일반 텍스트는 그대로 pi 프롬프트, 이미지와 텍스트·코드 파일은 첨부로 전달돼요. PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요.</i>",
 			"<i>pi 확장·스킬·프롬프트 템플릿 명령도 그대로 동작: /review, /skill:pdf, /mytemplate …</i>",
 			"<i>자동완성에 안 보이는 명령도 그대로 쳐면 동작해요. 자동완성 목록이 이상하면 /tg menu</i>",
 		];
@@ -446,13 +446,13 @@ export class CommandLayer {
 		if (raw) {
 			const level = map[raw];
 			if (level == null) {
-				await this.say(chatId, `사용법: ${inlineCode("/verbose 0|1|2")}\n0 답장만 · 1 답장+도구 요약 · 2 전체 미러링(thinking·결과 원문)`);
+				await this.say(chatId, `사용법: ${inlineCode("/verbose 0|1|2")}\n0 답장만 · 1 답장+도구 게시판 · 2 전체 미러링(thinking·결과 원문)`);
 				return;
 			}
 			this.hub.cfg.verbosity = level;
 			this.hub.save();
 		}
-		const labels = ["답장만 (answers only)", "답장 + 도구 요약 (default)", "전체 미러링 (full mirror)"];
+		const labels = ["답장만 (answers only)", "답장 + 도구 게시판 (default)", "전체 미러링 (full mirror)"];
 		await this.say(chatId, `🔍 detail ${this.hub.verbosity()} — ${labels[this.hub.verbosity()]}`);
 	}
 
@@ -471,20 +471,25 @@ export class CommandLayer {
 	 */
 	private async activity(chatId: number, args: string): Promise<void> {
 		const raw = args.trim().toLowerCase();
+		const detail = this.hub.verbosity();
+		const elsewhere = detail === 1 ? "" : `<i>지금은 상세 ${inlineCode(String(detail))}이라 이 게시판은 안 보여요 — 상세 1에서 동작해요.</i>`;
 		if (raw === "on" || raw === "off") {
 			this.hub.cfg.activityLive = raw === "on";
 			this.hub.save();
-			await this.say(
-				chatId,
-				this.hub.cfg.activityLive
-					? `🔧 도구 게시판 on — 한 턴이 메시지 하나로 끝나고, 도구가 진행되는 동안 그 메시지가 업데이트돼요.`
-					: `🔧 도구 게시판 off — 턴이 끝난 뒤 요약 메시지 하나만 보내요.`,
-			);
+			const mode = this.hub.cfg.activityLive
+				? `🔧 도구 게시판 on — 한 턴이 메시지 하나로 끝나고, 도구가 진행되는 동안 그 메시지가 업데이트돼요.`
+				: `🔧 도구 게시판 off — 턴이 끝난 뒤 요약 메시지 하나만 보내요.`;
+			await this.say(chatId, [mode, elsewhere].filter(Boolean).join("\n"));
 			return;
 		}
 		await this.say(
 			chatId,
-			`🔧 상세 1의 도구 게시판: <b>${this.hub.cfg.activityLive ? "실시간 업데이트 (현재)" : "턴 끝에 요약만 (현재)"}</b> · 설정: ${inlineCode("/tg activity on|off")} · 상세 설정: ${inlineCode("/verbose 0|1|2")}`,
+			[
+				`🔧 도구 게시판: <b>${this.hub.cfg.activityLive ? "실시간 업데이트" : "턴 끝에 요약만"}</b> · 현재 상세 ${inlineCode(String(detail))}`,
+				detail === 1
+					? `<i>전환: ${inlineCode("/tg activity on|off")} · 상세 설정: ${inlineCode("/verbose 0|1|2")}</i>`
+					: `<i>이 설정은 상세 ${inlineCode("1")}에서만 동작해요 — 지금 상세에서는 영향이 없어요.</i> · 상세 설정: ${inlineCode("/verbose 0|1|2")}`,
+			].join("\n"),
 		);
 	}
 

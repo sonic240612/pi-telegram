@@ -56,6 +56,12 @@ interface TurnSummary {
 
 /** How many tool lines the live “이번 턴” board keeps before folding the older ones. */
 const BOARD_LINES = 6;
+/**
+ * While a call is still running the board is repainted on a timer, so its “진행 중… 12s” counter
+ * keeps moving — one long `bash npm test` must not look like a frozen chat. Slower than the edit
+ * interval, so the pulse can never outrun Telegram's budget.
+ */
+const ACTIVITY_PULSE_MS = 3500;
 
 export class OutboundMirror {
 	private readonly hub: Hub;
@@ -78,6 +84,8 @@ export class OutboundMirror {
 	 * working we pulse it. Without that the chat looks dead for the whole run.
 	 */
 	private typingTimer?: ReturnType<typeof setTimeout>;
+	/** Repaints boards that have a call in flight (see `ACTIVITY_PULSE_MS`). */
+	private activityTimer?: ReturnType<typeof setInterval>;
 
 	constructor(hub: Hub, drafts: DraftManager, activity: DraftManager) {
 		this.hub = hub;
@@ -105,12 +113,15 @@ export class OutboundMirror {
 		pi.on("agent_settled", (event) => {
 			if (event.aborted) this.enqueue(() => this.sendHtmlAll("⛔ <i>중단했어요.</i>"));
 			this.enqueue(async () => {
+				this.stopActivityPulse();
+				await this.sealBoards(event.aborted ? "⛔ 중단됨" : "⚠️ 턴이 끝까지 가지 못했어요");
 				this.turns = new Map();
 			});
 			this.stopTyping();
 		});
 		pi.on("turn_start", () => {
 			this.enqueue(async () => {
+				this.stopActivityPulse();
 				this.turns = new Map();
 				for (const chatId of this.chats()) this.turns.set(chatId, { tools: [], startedAt: Date.now() });
 				// A board the previous turn left unfinished (aborted run, detail switched mid-turn) must not
@@ -317,6 +328,7 @@ export class OutboundMirror {
 		const usage = readUsage((message as { usage?: unknown } | undefined)?.usage);
 		const durationMs = (message as { durationMs?: number } | undefined)?.durationMs;
 		const verbosity = this.verbosity();
+		this.stopActivityPulse();
 		for (const [chatId, turn] of this.turns) {
 			if (usage) turn.usage = usage;
 			if (durationMs) turn.durationMs = durationMs;
@@ -341,11 +353,15 @@ export class OutboundMirror {
 		this.turns = new Map();
 	}
 
-	private summaryHtml(turn: TurnSummary): string {
+	private summaryHtml(turn: TurnSummary, tail?: string): string {
 		const footer = usageLine(turn.usage, turn.durationMs);
-		const head = footer ? `🔧 <b>이번 턴</b> · ${turn.tools.length}회 <i>${escapeHtml(footer)}</i>` : `🔧 <b>이번 턴</b> · ${turn.tools.length}회`;
+		const headBits = [`🔧 <b>이번 턴</b> · ${turn.tools.length}회`];
+		if (footer) headBits.push(`<i>${escapeHtml(footer)}</i>`);
+		if (tail) headBits.push(`<i>${escapeHtml(tail)}</i>`);
+		const head = headBits.join(" ");
 		const lines = turn.tools.map(
-			(tool) => `${tool.isError ? "❌" : iconFor(tool.name)} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 160))}${tool.durationMs !== undefined ? ` <i>${escapeHtml(formatCount(tool.durationMs / 1000))}s</i>` : ""}`,
+			(tool) =>
+				`${tool.durationMs === undefined ? "⏹️" : tool.isError ? "❌" : iconFor(tool.name)} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 160))}${tool.durationMs !== undefined ? ` <i>${escapeHtml(formatCount(tool.durationMs / 1000))}s</i>` : ""}`,
 		);
 		return [head, ...lines].join("\n");
 	}
@@ -358,6 +374,7 @@ export class OutboundMirror {
 	private async paintBoard(chatId: number, turn: TurnSummary): Promise<void> {
 		if (!this.hub.cfg.activityLive) return;
 		if (!turn.tools.length) return; // a race must never leave an empty board on screen
+		if (this.activity.isSealed(chatId)) return; // that turn's board is already history
 		const running = turn.tools.filter((tool) => tool.durationMs === undefined);
 		const failed = turn.tools.filter((tool) => tool.isError).length;
 		const head = [
@@ -373,6 +390,44 @@ export class OutboundMirror {
 			lines.push(`${mark} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 120))}`);
 		}
 		await this.activity.update(chatId, lines.join("\n"));
+		if (running.length) this.startActivityPulse();
+	}
+
+	/**
+	 * Close whatever boards are still open when a run ends without finishing its turn (aborted, or pi
+	 * stopped inside a call). Without this the board keeps reading “진행 중…” with a ⚙️ on a call that
+	 * will never return.
+	 */
+	private async sealBoards(tail: string): Promise<void> {
+		if (this.verbosity() !== 1 || !this.hub.cfg.activityLive) return;
+		for (const [chatId, turn] of this.turns) {
+			if (!turn.tools.length) continue;
+			await this.activity.finalize(chatId, this.summaryHtml(turn, tail));
+		}
+	}
+
+	/** Keep the “진행 중…” clock moving while a call is in flight. */
+	private startActivityPulse(): void {
+		if (this.activityTimer) return;
+		const timer = setInterval(() => {
+			this.enqueue(async () => {
+				let alive = false;
+				for (const [chatId, turn] of this.turns) {
+					if (!turn.tools.some((tool) => tool.durationMs === undefined)) continue;
+					await this.paintBoard(chatId, turn);
+					alive = true;
+				}
+				if (!alive) this.stopActivityPulse();
+			});
+		}, ACTIVITY_PULSE_MS);
+		timer.unref?.();
+		this.activityTimer = timer;
+	}
+
+	/** Public because the bridge tears the mirror down when pi replaces the session. */
+	stopActivityPulse(): void {
+		if (this.activityTimer) clearInterval(this.activityTimer);
+		this.activityTimer = undefined;
 	}
 
 	private newTurn(chatId: number): TurnSummary {

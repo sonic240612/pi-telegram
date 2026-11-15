@@ -84,6 +84,11 @@ export class DraftManager {
 		draft.timer = timer;
 	}
 
+	/** A sealed draft is chat history: live updates have nowhere to go, so callers must not knock on it. */
+	isSealed(chatId: number): boolean {
+		return Boolean(this.drafts.get(chatId)?.sealed);
+	}
+
 	private applyNow(chatId: number, draft: DraftState, text: string): void {
 		const bot = this.bot();
 		if (!bot) return;

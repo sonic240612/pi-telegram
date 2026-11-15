@@ -275,9 +275,12 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   "입력 중…" hint every ~4.5s (it expires on its own after ~5s) and stops as soon as the run ends.
 * **A turn reads like pi's own status line.** At detail `1` the tools of a turn share one
   `🔧 이번 턴` message that grows as calls start and finish — `⚙️` on the running call, `❌` on the
-  failed ones — and becomes the turn summary (tokens, cost, time) when the turn ends. Edits are
-  capped at one per chat every ~2.5s and the board is separate from the streaming answer, so the two
-  never overwrite each other. `/tg activity off` sends the summary at turn end instead.
+  failed ones — and becomes the turn summary (tokens, cost, time) when the turn ends. While a call is
+  still running its header counts (`진행 중… 12.4s`), so a slow turn does not look dead, and if the
+  run stops inside a call the board is closed where it stands (`⛔ 중단됨`) instead of pretending work
+  is still going on. Edits are capped at one per chat every ~2.5s, the board is separate from the
+  streaming answer so the two never overwrite each other, and `/tg activity` tells you which mode you
+  are in (it only exists at detail `1`).
 * **Three separate lanes against Telegram.** Long polling (`getUpdates`, up to 25s open), message
   sending, and auxiliary hints (`sendChatAction`) never share a queue. A parked poll or a dropped
   typing hint cannot delay an answer — that used to be where "the reply showed up 20 seconds later"

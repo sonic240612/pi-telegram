@@ -616,6 +616,7 @@ export class TelegramBridge implements Hub {
 			this.inFlight.clear();
 		}
 		this.mirror.stopTyping();
+		this.mirror.stopActivityPulse();
 		this.drafts.releaseAll();
 		this.activity.releaseAll();
 		this.refreshStatus();
@@ -862,7 +863,10 @@ export class TelegramBridge implements Hub {
 			: "";
 		const body = `${quoted}${text}`.trim();
 		if (!body && !images.length) {
-			await this.sendHtml(chatId, "ℹ️ 텍스트·이미지·PDF·코드 파일을 보내 주세요. 명령어 목록은 /help");
+			await this.sendHtml(
+				chatId,
+				"ℹ️ 텍스트나 이미지를 보내 주세요 — 코드·텍스트 파일도 첨부로 열어요.\n· PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요 · 명령어 목록은 /help",
+			);
 			return;
 		}
 		if (body) this.noteTelegramInput(body);
@@ -1035,7 +1039,9 @@ export class TelegramBridge implements Hub {
 					notes.push(`file read failed: ${errorMessage(error)}`);
 				}
 			} else {
-				notes.push(`unsupported attachment: ${safeFileName(document.file_name ?? "")} (${formatBytes(document.file_size ?? 0)}) — save it locally and reference the path`);
+				notes.push(
+					`unsupported attachment: ${safeFileName(document.file_name ?? "")} (${formatBytes(document.file_size ?? 0)}) — pi가 바로 읽지 못해요. 파일은 컴퓨터에 있으니 경로를 알려주세요`,
+				);
 			}
 		}
 		if (message.audio || message.voice) notes.push("voice messages are not transcribed — send text");

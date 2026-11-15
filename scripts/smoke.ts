@@ -753,6 +753,55 @@ await waitFor("the raced tool still reaches the board", () => calls.slice(racedC
 check("a turn_start mid-flight does not lose the tool line", calls.slice(racedCalls).some((call) => String(call.params.text).includes("echo raced tool")), JSON.stringify(calls.slice(racedCalls).map((call) => String(call.params.text).slice(0, 40))));
 check("an empty board never reaches the chat", !calls.some((call) => String(call.params.text).includes(`${BOARD_MARK} · 0회`)), JSON.stringify(calls.filter((call) => String(call.params.text).includes(BOARD_MARK)).map((call) => String(call.params.text).slice(0, 40))));
 
+// One long call must still look alive, and a run that stops inside a call must not leave the board
+// claiming work is going on.
+idle = false;
+emit("agent_start", { type: "agent_start" });
+emit("turn_start", { type: "turn_start", turnIndex: 0 });
+emit("tool_execution_start", { type: "tool_execution_start", toolCallId: "slow1", toolName: "bash", args: { command: "sleep 90" } });
+await waitFor("the board shows the long call running", () => boardSends(CHAT).some((call) => String(call.params.text).includes("sleep 90")), 8000);
+const slowBoardId = Number(boardSends(CHAT).filter((call) => String(call.params.text).includes("sleep 90")).at(-1)?.id);
+const boardClocks = () =>
+	boardEdits(CHAT)
+		.filter((call) => Number(call.params.message_id) === slowBoardId)
+		.map((call) => String(call.params.text).match(/진행 중… ([\d.]+m?s)/)?.[1] ?? "-");
+await waitFor("the board clock keeps moving while one call runs", () => new Set(boardClocks()).size >= 2, 15_000);
+check("a long call keeps its board alive", new Set(boardClocks()).size >= 2, JSON.stringify(boardClocks()));
+emit("agent_end", { type: "agent_end" });
+emit("agent_settled", { type: "agent_settled", aborted: true });
+idle = true;
+await waitFor(
+	"the abandoned board is closed",
+	() => boardEdits(CHAT).some((call) => Number(call.params.message_id) === slowBoardId && /중단됨/.test(String(call.params.text))),
+	12_000,
+);
+const abandonedBoard = String(
+	boardEdits(CHAT)
+		.filter((call) => Number(call.params.message_id) === slowBoardId)
+		.at(-1)
+		?.params.text ?? "",
+);
+check(
+	"an abandoned board says the call never finished",
+	abandonedBoard.includes("중단됨") && abandonedBoard.includes("sleep 90") && abandonedBoard.includes("⏹️") && !abandonedBoard.includes("진행 중"),
+	abandonedBoard.slice(0, 200),
+);
+check("an aborted run still tells the chat it stopped", textMessages("중단했어요").length > 0);
+
+// /tg activity has to say when its own setting cannot be seen.
+pushMessage(CHAT, "/verbose 2");
+await waitFor("detail raised to 2", () => textMessages("detail 2").length > 0);
+pushMessage(CHAT, "/tg activity");
+await waitFor("activity status at detail 2", () => textMessages("도구 게시판:").length > 0);
+const activityStatus = String(textMessages("도구 게시판:").at(-1)?.params.text ?? "").replace(/<[^>]*>/g, "");
+check(
+	"/tg activity names the detail level and where the board shows",
+	activityStatus.includes("현재 상세 2") && activityStatus.includes("상세 1에서만"),
+	activityStatus.slice(0, 200),
+);
+pushMessage(CHAT, "/verbose 1");
+await waitFor("detail back to 1", () => textMessages("detail 1").length > 0);
+
 // 5. /model list + inline keyboard switches the model
 pushMessage(CHAT, "/model");
 await waitFor("model list", () => lastKeyboard("model").length > 0);
@@ -892,7 +941,17 @@ await waitFor("text document inlined", () => promptText().includes("Attached fil
 check("text document inlined as a prompt", promptText().includes("```"), promptText().slice(-160));
 pushMessage(CHAT, "here is an archive", { document: { file_id: "bin1", file_name: "app.zip", mime_type: "application/zip", file_size: 900 } });
 await waitFor("unsupported attachment notice", () => textMessages("unsupported attachment").length > 0);
-check("unsupported attachment explained, not silently dropped", true);
+const unsupportedNote = String(textMessages("unsupported attachment").at(-1)?.params.text ?? "");
+check(
+	"unsupported attachment explained, not silently dropped",
+	unsupportedNote.includes("app.zip") && unsupportedNote.includes("경로를 알려주세요") && /\(900/.test(unsupportedNote),
+	unsupportedNote.slice(0, 180),
+);
+check(
+	"the bridge never promises to carry files it rejects",
+	!calls.some((call) => /텍스트·이미지·PDF|이미지·PDF·코드/.test(String(call.params.text ?? ""))),
+	JSON.stringify(calls.filter((call) => /PDF/.test(String(call.params.text ?? ""))).map((call) => String(call.params.text).slice(0, 60))),
+);
 pushMessage(CHAT, "", { voice: { file_id: "v1", file_size: 10 } });
 await waitFor("voice notice", () => textMessages("voice messages are not transcribed").length > 0);
 check("voice messages explained", true);
@@ -995,8 +1054,12 @@ pushEdited(CHAT, "i edited my message");
 await waitFor("edited notice", () => textMessages("편집된 메시지").length > 0);
 check("edited messages ignored with a notice", !promptText().includes("i edited my message"));
 pushMessage(CHAT, "   ");
-await waitFor("empty hint", () => textMessages("텍스트·이미지").length > 0);
-check("empty message gets a hint instead of an empty prompt", !userMessages.some((entry) => entry.content === "   "));
+await waitFor("empty hint", () => textMessages("텍스트나 이미지를").length > 0);
+check(
+	"empty message gets a hint that names what the bridge can carry",
+	!userMessages.some((entry) => entry.content === "   ") && /경로를 말해 주세요/.test(String(textMessages("텍스트나 이미지를").at(-1)?.params.text ?? "")),
+	String(textMessages("텍스트나 이미지를").at(-1)?.params.text ?? "").slice(0, 160),
+);
 
 // 16b. pi refuses a prompt: the chat is told, not left hanging
 suppressRunStart = true;
