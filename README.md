@@ -8,6 +8,12 @@ pi keeps owning the session. The extension mirrors what the terminal shows, turn
 attachments into pi prompts, and re-implements the pi commands that matter as chat messages with
 inline keyboards. One running pi session ↔ one or more Telegram chats.
 
+Two other extensions are bridged rather than reimplemented, so the phone is not left out of the loop:
+**[`@juicesharp/rpiv-ask-user-question`](#questionnaires-and-goals-from-other-extensions)** (its
+questionnaires become tappable buttons on the phone) and **[`pi-goal-x`](#questionnaires-and-goals-from-other-extensions)**
+(its goal shows up as a `/tg goal` card, a line in `/status`, and transition news). Both are optional —
+without them those features simply stay quiet.
+
 ```
 Telegram  ──poll──▶  bridge  ──▶  prompts, /commands, keyboard taps
    ▲                   │
