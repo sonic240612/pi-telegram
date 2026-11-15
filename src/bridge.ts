@@ -43,6 +43,11 @@ const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const ECHO_TTL_MS = 120_000;
 /** How long to wait for pi to start a run after a Telegram prompt before telling the chat. */
 const PROMPT_WATCHDOG_MS = 8000;
+/**
+ * The live “이번 턴” board shares a chat with the streaming answer draft, and Telegram only tolerates
+ * about one edit per second per chat — so the board edits more slowly than the answer does.
+ */
+const ACTIVITY_EDIT_INTERVAL_MS = 2500;
 const THINKING_LEVEL_VALUES = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 type TextPart = { type: "text"; text: string };
@@ -71,6 +76,8 @@ export class TelegramBridge implements Hub {
 	bot?: TelegramBot;
 
 	private readonly drafts: DraftManager;
+	/** One live tool board per chat (detail level 1), kept separate from the answer draft. */
+	private readonly activity: DraftManager;
 	private readonly commands: CommandLayer;
 	private readonly mirror: OutboundMirror;
 	/** Questionnaires other extensions ask (rpiv-ask-user-question), mirrored into the chats. */
@@ -138,8 +145,9 @@ export class TelegramBridge implements Hub {
 		this.pi = pi;
 		this.cfg = loadConfig();
 		this.drafts = new DraftManager(() => this.bot);
+		this.activity = new DraftManager(() => this.bot, ACTIVITY_EDIT_INTERVAL_MS);
 		this.commands = new CommandLayer(this);
-		this.mirror = new OutboundMirror(this, this.drafts);
+		this.mirror = new OutboundMirror(this, this.drafts, this.activity);
 		this.questions = new QuestionnaireBridge(this);
 	}
 
@@ -609,6 +617,7 @@ export class TelegramBridge implements Hub {
 		}
 		this.mirror.stopTyping();
 		this.drafts.releaseAll();
+		this.activity.releaseAll();
 		this.refreshStatus();
 	}
 

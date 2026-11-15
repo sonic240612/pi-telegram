@@ -616,6 +616,39 @@ if (!skipPrompt) {
 	check("a prompt pi cannot run still explains itself", /❌|⚠️/.test(outcome) || /pong/i.test(outcome), scrub(outcome).slice(0, 200));
 	check("model failures are reported in chat, not swallowed", !/❌/.test(outcome) || /Key limit|403|exceeded/i.test(outcome), scrub(outcome).slice(0, 200));
 	await sleep(2000);
+
+	// Detail 1 should read like pi's own status line: one board message per turn, edited while the
+	// tools run, instead of a message per tool call. Needs a model, so it skips on provider trouble.
+	const beforeBoardPrompt = replies().length;
+	const callsBeforeBoard = calls.length;
+	send(CHAT, "Use a tool to list the files in this directory, then reply with exactly one word: pong");
+	await waitFor(() => replies().slice(beforeBoardPrompt).some((text) => /pong|❌|⚠️/i.test(text)), 120_000);
+	const boardWindow = replies().slice(beforeBoardPrompt).join(" | ");
+	const boardCalls = calls.slice(callsBeforeBoard).filter((call) => /🔧 <b>이번 턴<\/b>/.test(String(call.params.text ?? "")) && Number(call.params.chat_id) === CHAT);
+	const boardSents = boardCalls.filter((call) => call.method === "sendMessage");
+	const boardEdits = boardCalls.filter((call) => call.method === "editMessageText");
+	if (boardCalls.length === 0 && /No API key|Key limit|403|exceeded|not logged in|실행되지 않았어요|provider 인증|unknown\/unknown/i.test(boardWindow)) {
+		console.log(`  --   no usable provider — live tool board check skipped · ${shape(boardWindow)}`);
+	} else {
+		const standaloneTools = calls
+			.slice(callsBeforeBoard)
+			.filter(
+				(call) =>
+					call.method === "sendMessage" &&
+					!/🔧 <b>이번 턴<\/b>/.test(String(call.params.text ?? "")) &&
+					/<code>(read|bash|edit|write|grep|find)<\/code>/.test(String(call.params.text ?? "")),
+			);
+		check(
+			"a tool run gives the phone one board message it can watch grow",
+			boardSents.length >= 1 && boardEdits.length >= 1,
+			scrub(`sends=${boardSents.length} edits=${boardEdits.length} · ${String(boardSents.at(-1)?.params.text ?? "").slice(0, 120)}`),
+		);
+		check(
+			"detail 1 sends no separate message per tool call",
+			standaloneTools.length === 0,
+			JSON.stringify(standaloneTools.map((call) => String(call.params.text ?? "").slice(0, 60))),
+		);
+	}
 }
 
 if (goalPackageLoaded && process.env.PI_TG_LIVE_GOAL === "1") {

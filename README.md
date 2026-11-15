@@ -17,7 +17,7 @@ without them those features simply stay quiet.
 ```
 Telegram  ──poll──▶  bridge  ──▶  prompts, /commands, keyboard taps
    ▲                   │
-   └── HTML messages ──┘  answers, tool summaries, thinking, failures
+   └── HTML messages ──┘  answers, a live tool board per turn, thinking, failures
 ```
 
 ## Install
@@ -116,7 +116,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 
 | Command | Arguments | What it does |
 | --- | --- | --- |
-| `/verbose` `[0\|1\|2]` | level | `0` answers only · `1` (default) answers + tool summary · `2` full transcript mirror. |
+| `/verbose` `[0\|1\|2]` | level | `0` answers only · `1` (default) answers + a live tool board per turn · `2` full transcript mirror. |
 | `/stream` `[on\|off]` | `on` / `off` | Live draft editing while pi writes the answer. |
 | `/ping` | — | Round-trip check: bot name + latency. |
 | `/stats` | — | Latency bookkeeping (same as `/tg stats`; long polls are counted separately so they do not look like slow sends). |
@@ -136,6 +136,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tg chats` | — | Paired chats. |
 | `/tg restart` | — | Reconnect. |
 | `/tg verbose [0\|1\|2]` · `/tg stream [on\|off]` | | Same as the top-level commands. |
+| `/tg activity [on\|off]` | | At detail `1`, either keep one tool board live during the turn (default) or show only the summary when the turn ends. |
 | `/tg stats` (alias `/tg latency`) | — | Telegram call count / average / max, poll count, slow calls, 429s, and prompt → run-start delay. Tells you whether a slow reply is pi thinking or the network. |
 | `/tg menu` | — | Re-register the “/” autocomplete menu and verify what Telegram serves. Use it when the autocomplete list looks wrong (see below). |
 | `/tg redact [on\|off]` · `/tg redact transcript [on\|off]` | | Control how much credential scrubbing the bridge applies to the copies it makes for Telegram (`/bash` output is scrubbed by default; the mirrored transcript is not). |
@@ -211,10 +212,20 @@ split without losing characters; nothing is silently truncated.
 | Level | What Telegram sees |
 | --- | --- |
 | `0` | answers only |
-| `1` (default) | answers + one compact tool summary per turn |
+| `1` (default) | answers + one tool board per turn, updated while the tools run |
 | `2` | full transcript: thinking, tool calls, tool results, usage footers |
 
 Set with `/verbose 2`, or in pi with `/telegram-verbose 2`.
+
+At detail `1` the turn's tools live in a single message — pi's bottom status line, moved to the
+phone: `🔧 이번 턴 · 3회`, one line per call (`📖 read src/a.ts`, `💻 bash npm test`), `⚙️` on the call
+that is still running, `❌` on the ones that failed, older calls folded after the last six. While a
+call is in flight the header reads `진행 중… 12.4s`, so a slow turn is visible from the notification
+alone. The
+board is edited as calls start and finish (at most one edit every 2.5 s per chat, which is about what
+Telegram allows), and it is a separate message from the streaming answer, so neither overwrites the
+other. When the turn ends the same message becomes the summary, with token and time footers.
+`/tg activity off` (or `activityLive: false`) keeps only that final summary.
 
 ## Tools the model can call
 
@@ -239,6 +250,7 @@ want the tool available at all — remove it from pi's tool list if you do not.
 | `chats` | paired chats `[{ chatId, label, name }]` |
 | `verbosity` | `0` / `1` / `2` |
 | `streaming` | live draft editing while pi streams |
+| `activityLive` | at detail `1`, keep the turn's tool board updated during the turn (default `true`; `false` = summary at turn end only) |
 | `announce` | connect/disconnect notices |
 | `redactBash` | scrub credential-looking text out of `/bash` output the bridge copies to Telegram (default `true`) |
 | `redactTranscript` | also scrub the mirrored transcript (default `false` — detail mode should match the terminal) |
@@ -261,6 +273,11 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   that still shows nothing but "⏳ 생각 중…" is deleted.
 * **You can tell pi is working.** While a run is in flight the bridge refreshes Telegram's
   "입력 중…" hint every ~4.5s (it expires on its own after ~5s) and stops as soon as the run ends.
+* **A turn reads like pi's own status line.** At detail `1` the tools of a turn share one
+  `🔧 이번 턴` message that grows as calls start and finish — `⚙️` on the running call, `❌` on the
+  failed ones — and becomes the turn summary (tokens, cost, time) when the turn ends. Edits are
+  capped at one per chat every ~2.5s and the board is separate from the streaming answer, so the two
+  never overwrite each other. `/tg activity off` sends the summary at turn end instead.
 * **Three separate lanes against Telegram.** Long polling (`getUpdates`, up to 25s open), message
   sending, and auxiliary hints (`sendChatAction`) never share a queue. A parked poll or a dropped
   typing hint cannot delay an answer — that used to be where "the reply showed up 20 seconds later"

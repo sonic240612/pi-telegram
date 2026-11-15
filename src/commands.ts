@@ -184,7 +184,7 @@ export class CommandLayer {
 			["모델·도구", "/model [이름·검색어] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<이름>]"],
 			["실행 제어", "/abort · /steer <메시지> · /queue <메시지> · /bash <셸 명령>"],
 			["상태·표시", "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact|goal"],
+			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal"],
 		];
 		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
 		const notes = [
@@ -232,7 +232,7 @@ export class CommandLayer {
 			`entries ${inlineCode(String(info.entries))} · messages ${inlineCode(String(info.messages))}`,
 			`context ${inlineCode(usage?.percent != null ? `${usage.percent.toFixed(1)}%` : usage?.tokens != null ? `${formatCount(usage.tokens)} tok` : "unknown")}`,
 			`tools ${inlineCode(active.join(", ") || "none")}`,
-			`detail ${inlineCode(String(this.hub.verbosity()))} · drafts ${inlineCode(this.hub.cfg.streaming ? "on" : "off")} · ${inlineCode(this.hub.isIdle() ? "idle" : "running")}`,
+			`detail ${inlineCode(String(this.hub.verbosity()))} · drafts ${inlineCode(this.hub.cfg.streaming ? "on" : "off")} · 도구 ${inlineCode(this.hub.cfg.activityLive ? "실시간" : "마지막 요약")} · ${inlineCode(this.hub.isIdle() ? "idle" : "running")}`,
 		];
 		const goal = this.hub.goalState().goal;
 		// A goal is the one thing /status cannot show from pi's own state, and the one thing a phone
@@ -465,6 +465,29 @@ export class CommandLayer {
 		await this.say(chatId, `✍️ 실시간 초안 ${this.hub.cfg.streaming ? "on" : "off"}`);
 	}
 
+	/**
+	 * Detail level 1 writes each turn's tool activity into one message that is edited as tools run —
+	 * pi's status line, in the chat — instead of one summary when the turn ends.
+	 */
+	private async activity(chatId: number, args: string): Promise<void> {
+		const raw = args.trim().toLowerCase();
+		if (raw === "on" || raw === "off") {
+			this.hub.cfg.activityLive = raw === "on";
+			this.hub.save();
+			await this.say(
+				chatId,
+				this.hub.cfg.activityLive
+					? `🔧 도구 게시판 on — 한 턴이 메시지 하나로 끝나고, 도구가 진행되는 동안 그 메시지가 업데이트돼요.`
+					: `🔧 도구 게시판 off — 턴이 끝난 뒤 요약 메시지 하나만 보내요.`,
+			);
+			return;
+		}
+		await this.say(
+			chatId,
+			`🔧 상세 1의 도구 게시판: <b>${this.hub.cfg.activityLive ? "실시간 업데이트 (현재)" : "턴 끝에 요약만 (현재)"}</b> · 설정: ${inlineCode("/tg activity on|off")} · 상세 설정: ${inlineCode("/verbose 0|1|2")}`,
+		);
+	}
+
 	/** How hard the bridge scrubs credentials from the copies it makes for Telegram. */
 	private async redact(chatId: number, args: string): Promise<void> {
 		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -538,6 +561,8 @@ export class CommandLayer {
 				return this.verbose(chatId, rest);
 			case "stream":
 				return this.stream(chatId, rest);
+			case "activity":
+				return this.activity(chatId, rest);
 			case "redact":
 				return this.redact(chatId, rest);
 			case "stats":
@@ -551,7 +576,7 @@ export class CommandLayer {
 				return this.say(chatId, goalCardHtml(state.goal, state.focus));
 			}
 			default:
-				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|stats|menu|redact|goal")}`);
+				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal")}`);
 		}
 	}
 

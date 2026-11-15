@@ -51,11 +51,17 @@ interface TurnSummary {
 	tools: ToolNote[];
 	usage?: UsageInfo;
 	durationMs?: number;
+	startedAt: number;
 }
+
+/** How many tool lines the live “이번 턴” board keeps before folding the older ones. */
+const BOARD_LINES = 6;
 
 export class OutboundMirror {
 	private readonly hub: Hub;
 	private readonly drafts: DraftManager;
+	/** The live per-turn tool board (detail level 1): one message, edited as tools run. */
+	private readonly activity: DraftManager;
 
 	/** Per-chat state for the turn in flight. Chats paired mid-run join from here on. */
 	private turns = new Map<number, TurnSummary>();
@@ -73,17 +79,22 @@ export class OutboundMirror {
 	 */
 	private typingTimer?: ReturnType<typeof setTimeout>;
 
-	constructor(hub: Hub, drafts: DraftManager) {
+	constructor(hub: Hub, drafts: DraftManager, activity: DraftManager) {
 		this.hub = hub;
 		this.drafts = drafts;
+		this.activity = activity;
 	}
 
 	/** Subscribe to every pi event this module cares about. */
 	register(pi: ExtensionAPI): void {
 		pi.on("agent_start", () => {
-			this.turns = new Map();
 			this.hub.setWorkingNotice("⏳ pi 작업 중");
 			this.startTyping();
+			// Anything that touches `turns` is queued: pi can fire turn_start while the previous turn's
+			// tool handlers are still in flight, and resetting the map synchronously loses their notes.
+			this.enqueue(async () => {
+				this.turns = new Map();
+			});
 		});
 		pi.on("agent_end", (event) => {
 			this.hub.setWorkingNotice(undefined);
@@ -93,12 +104,19 @@ export class OutboundMirror {
 		});
 		pi.on("agent_settled", (event) => {
 			if (event.aborted) this.enqueue(() => this.sendHtmlAll("⛔ <i>중단했어요.</i>"));
-			this.turns = new Map();
+			this.enqueue(async () => {
+				this.turns = new Map();
+			});
 			this.stopTyping();
 		});
 		pi.on("turn_start", () => {
-			this.turns = new Map();
-			for (const chatId of this.chats()) this.turns.set(chatId, { tools: [] });
+			this.enqueue(async () => {
+				this.turns = new Map();
+				for (const chatId of this.chats()) this.turns.set(chatId, { tools: [], startedAt: Date.now() });
+				// A board the previous turn left unfinished (aborted run, detail switched mid-turn) must not
+				// be edited by this one: forget it, without deleting the message.
+				for (const chatId of this.chats()) this.activity.release(chatId);
+			});
 		});
 		pi.on("turn_end", (event) => this.enqueue(() => this.handleTurnEnd(event.message)));
 		pi.on("message_start", (event) => this.enqueue(() => this.handleMessageStart(event.message)));
@@ -160,7 +178,7 @@ export class OutboundMirror {
 		if (roleOf(message) !== "assistant") return;
 		if (!this.hub.cfg.streaming) return;
 		for (const chatId of this.chats()) {
-			if (!this.turns.has(chatId)) this.turns.set(chatId, { tools: [] });
+			if (!this.turns.has(chatId)) this.turns.set(chatId, { tools: [], startedAt: Date.now() });
 			await this.drafts.update(chatId, "<i>⏳ 생각 중…</i>");
 		}
 	}
@@ -254,6 +272,7 @@ export class OutboundMirror {
 			turn.tools.push(note);
 			notes.push(note);
 			if (this.verbosity() === 2) await this.sendHtml(chatId, `${iconFor(toolName)} <code>${escapeHtml(toolName)}</code> ${escapeHtml(truncate(detail, 700))}`);
+			else if (this.verbosity() === 1) await this.paintBoard(chatId, turn);
 		}
 		this.noteRefs.set(toolCallId, notes);
 	}
@@ -280,6 +299,11 @@ export class OutboundMirror {
 			note.durationMs = durationMs;
 		}
 		for (const chatId of this.chats()) {
+			if (this.verbosity() === 1) {
+				const turn = this.turns.get(chatId);
+				if (turn) await this.paintBoard(chatId, turn);
+				continue;
+			}
 			if (this.verbosity() !== 2) continue;
 			const header = `${isError ? "❌" : iconFor(toolName)} <code>${escapeHtml(toolName)}</code> ${escapeHtml(truncate(detail, 300))}${durationMs !== undefined ? ` <i>(${escapeHtml(formatDuration(durationMs))})</i>` : ""}`;
 			const output = resultText(result);
@@ -297,7 +321,16 @@ export class OutboundMirror {
 			if (usage) turn.usage = usage;
 			if (durationMs) turn.durationMs = durationMs;
 			if (!turn.tools.length) continue;
-			if (verbosity === 1) await this.sendTurnSummary(chatId, turn);
+			if (verbosity === 1) {
+				// The board is already on screen (it grew while the tools ran): finish it in place, so a
+				// turn leaves exactly one message behind.
+				const summary = this.summaryHtml(turn);
+				const finished = await this.activity.finalize(chatId, summary);
+				if (finished === undefined) await this.sendHtml(chatId, summary);
+			} else {
+				// A board from a detail-1 turn must not be edited by a turn at another detail level.
+				this.activity.release(chatId);
+			}
 			if (verbosity === 2) {
 				const bits: string[] = [`도구 ${turn.tools.length}회`];
 				const footer = usageLine(turn.usage, turn.durationMs);
@@ -308,17 +341,42 @@ export class OutboundMirror {
 		this.turns = new Map();
 	}
 
-	private async sendTurnSummary(chatId: number, turn: TurnSummary): Promise<void> {
+	private summaryHtml(turn: TurnSummary): string {
 		const footer = usageLine(turn.usage, turn.durationMs);
 		const head = footer ? `🔧 <b>이번 턴</b> · ${turn.tools.length}회 <i>${escapeHtml(footer)}</i>` : `🔧 <b>이번 턴</b> · ${turn.tools.length}회`;
 		const lines = turn.tools.map(
 			(tool) => `${tool.isError ? "❌" : iconFor(tool.name)} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 160))}${tool.durationMs !== undefined ? ` <i>${escapeHtml(formatCount(tool.durationMs / 1000))}s</i>` : ""}`,
 		);
-		await this.sendHtml(chatId, [head, ...lines].join("\n"));
+		return [head, ...lines].join("\n");
+	}
+
+	/**
+	 * The live version of the turn summary: pi's bottom status line, but in the chat. One message per
+	 * turn, edited as tools start and finish; `finalize` replaces it with the full summary (durations
+	 * and usage) when the turn ends. A running tool has no duration yet, that is how it reads as live.
+	 */
+	private async paintBoard(chatId: number, turn: TurnSummary): Promise<void> {
+		if (!this.hub.cfg.activityLive) return;
+		if (!turn.tools.length) return; // a race must never leave an empty board on screen
+		const running = turn.tools.filter((tool) => tool.durationMs === undefined);
+		const failed = turn.tools.filter((tool) => tool.isError).length;
+		const head = [
+			`🔧 <b>이번 턴</b> · ${turn.tools.length}회`,
+			failed ? `❌ ${failed}개 실패` : "",
+			running.length ? `<i>진행 중… ${escapeHtml(formatDuration(Date.now() - turn.startedAt))}</i>` : "",
+		];
+		const shown = turn.tools.slice(-BOARD_LINES);
+		const lines = [head.filter(Boolean).join(" ")];
+		if (turn.tools.length > shown.length) lines.push(`· …그 이전 ${turn.tools.length - shown.length}회는 접었어요`);
+		for (const tool of shown) {
+			const mark = tool.isError ? "❌" : tool.durationMs === undefined ? "⚙️" : iconFor(tool.name);
+			lines.push(`${mark} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 120))}`);
+		}
+		await this.activity.update(chatId, lines.join("\n"));
 	}
 
 	private newTurn(chatId: number): TurnSummary {
-		const turn: TurnSummary = { tools: [] };
+		const turn: TurnSummary = { tools: [], startedAt: Date.now() };
 		this.turns.set(chatId, turn);
 		return turn;
 	}

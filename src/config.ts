@@ -22,6 +22,11 @@ export interface TelegramConfig {
 	verbosity: Verbosity;
 	/** Edit a live draft message while the assistant streams. */
 	streaming: boolean;
+	/**
+	 * Detail level 1 keeps one "이번 턴" message per turn and edits it as tools run, the way the pi
+	 * terminal updates its status line. Turn it off to get only the finished summary at turn end.
+	 */
+	activityLive: boolean;
 	/** Last processed getUpdates offset (resumes without replaying). */
 	offset?: number;
 	/** Send a notice when the bridge connects/disconnects. */
@@ -45,6 +50,7 @@ export const DEFAULT_CONFIG: TelegramConfig = {
 	chats: [],
 	verbosity: 1,
 	streaming: true,
+	activityLive: true,
 	announce: true,
 	redactBash: true,
 	redactTranscript: false,
@@ -91,6 +97,7 @@ export function loadConfig(): TelegramConfig {
 	}
 	if (value.verbosity === 0 || value.verbosity === 1 || value.verbosity === 2) cfg.verbosity = value.verbosity;
 	if (typeof value.streaming === "boolean") cfg.streaming = value.streaming;
+	if (typeof value.activityLive === "boolean") cfg.activityLive = value.activityLive;
 	if (typeof value.announce === "boolean") cfg.announce = value.announce;
 	if (typeof value.redactBash === "boolean") cfg.redactBash = value.redactBash;
 	if (typeof value.redactTranscript === "boolean") cfg.redactTranscript = value.redactTranscript;

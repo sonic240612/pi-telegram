@@ -632,9 +632,126 @@ check("markdown becomes Telegram HTML with escaping", answer.includes("<pre>") &
 check("per-turn tool summary at default detail", textMessages("이번 턴").some((call) => String(call.params.text).includes("read")), String(textMessages("이번 턴").at(-1)?.params.text).slice(0, 140));
 check("prompt typed in Telegram is not echoed back", !textMessages("please read src/index.ts").some((call) => Number(call.params.chat_id) === CHAT && !String(call.params.text).startsWith("/")));
 check("pi-side status widget shows the bridge", Object.keys(statuses).length > 0, JSON.stringify(statuses));
-const order = apiLog.findIndex((line) => line.includes("이번 턴"));
+await waitFor(
+	"the finished tool summary carries usage",
+	() => calls.some((call) => /🔧 <b>이번 턴<\/b>[\s\S]*tok/.test(String(call.params.text))),
+	12_000,
+);
+const order = apiLog.findIndex((line) => line.includes("이번 턴") && line.includes("tok"));
 const answerAt = apiLog.findIndex((line) => line.includes("const x = 1;"));
-check("answer is delivered before its tool summary", answerAt >= 0 && answerAt < order, `answer=${answerAt} summary=${order}`);
+check("answer is delivered before its finished tool summary", answerAt >= 0 && answerAt < order, `answer=${answerAt} summary=${order}`);
+
+// 4b. Detail 1 keeps ONE activity message per turn per chat: it appears when the first tool starts,
+// is edited as tools run (pi's status line, in the chat), and is finished in place — never one
+// message per tool call. Both paired chats get their own board.
+const BOARD_MARK = "🔧 <b>이번 턴</b>";
+const boardSends = (chatId = CHAT) => calls.filter((call) => call.method === "sendMessage" && String(call.params.text).includes(BOARD_MARK) && Number(call.params.chat_id) === chatId);
+const boardEdits = (chatId = CHAT) => calls.filter((call) => call.method === "editMessageText" && String(call.params.text).includes(BOARD_MARK) && Number(call.params.chat_id) === chatId);
+const editsOn = (messageId: number | undefined) => boardEdits().filter((call) => Number(call.params.message_id) === messageId);
+const boardsBefore = boardSends().length;
+const editsBefore = boardEdits().length;
+const callsBefore = calls.length;
+idle = false;
+emit("agent_start", { type: "agent_start" });
+emit("turn_start", { type: "turn_start", turnIndex: 0 });
+const boardTools: [string, unknown][] = [
+	["read", { path: "src/a.ts" }],
+	["bash", { command: "npm test" }],
+	["edit", { path: "src/b.ts" }],
+	["read", { path: "src/c.ts" }],
+	["read", { path: "src/d.ts" }],
+	["read", { path: "src/e.ts" }],
+	["read", { path: "src/f.ts" }],
+	["read", { path: "src/g.ts" }],
+];
+boardTools.forEach(([toolName, args], index) => {
+	emit("tool_execution_start", { type: "tool_execution_start", toolCallId: `board${index}`, toolName, args });
+	emit("tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: `board${index}`,
+		toolName,
+		result: { content: [{ type: "text", text: "ok" }] },
+		isError: index === 1,
+		durationMs: 100 + index * 50,
+	});
+});
+await waitFor("a live tool board appears", () => boardSends().length > boardsBefore, 12_000);
+const boardId = boardSends().at(-1)?.id;
+check("the board says work is in progress and how long it has run", /진행 중… \d/.test(String(boardSends().at(-1)?.params.text ?? "")), String(boardSends().at(-1)?.params.text).slice(0, 160));
+check("the board marks the running tool", /⚙️ <code>read<\/code> src\/a\.ts/.test(String(boardSends().at(-1)?.params.text ?? "")), String(boardSends().at(-1)?.params.text).slice(0, 160));
+await waitFor("the board is edited while tools run", () => boardEdits().length > editsBefore, 12_000);
+if (process.env.PI_TG_SMOKE_DUMP) {
+	await sleep(3000);
+	console.log("BOARD", JSON.stringify([...boardSends(), ...boardEdits()].map((call) => ({ m: call.method, id: call.id, chat: call.params.chat_id, t: String(call.params.text) })), null, 1));
+}
+await waitFor(
+	"the live board folds the older tools",
+	() => boardEdits().slice(editsBefore).some((call) => String(call.params.text).includes("그 이전")),
+	12_000,
+);
+check("eight tools fold older lines on the live board", boardEdits().slice(editsBefore).some((call) => /그 이전 2회는 접었어요/.test(String(call.params.text))), String(boardEdits().at(-1)?.params.text).slice(0, 220));
+emit("turn_end", {
+	type: "turn_end",
+	turnIndex: 0,
+	message: { role: "assistant", usage: { input: 1200, output: 340, totalTokens: 1540, cost: { total: 0.0031 } }, durationMs: 4_000 },
+});
+emit("agent_end", { type: "agent_end" });
+emit("agent_settled", { type: "agent_settled", aborted: false });
+idle = true;
+await waitFor("the board is finished in place with usage", () => editsOn(boardId).some((call) => String(call.params.text).includes("tok")), 12_000);
+check("eight tools still create exactly one activity message per chat", boardSends().length === boardsBefore + 1 && boardSends(OTHER).length >= 1, `sends=${boardSends().length - boardsBefore}`);
+const finished = String(editsOn(boardId).at(-1)?.params.text ?? "");
+check(
+	"the board is updated in place, never replaced by a second message",
+	boardId !== undefined && editsOn(boardId).length >= 2,
+	JSON.stringify({ boardId, edits: editsOn(boardId).length }),
+);
+check(
+	"the finished board lists all eight tools with usage, folds gone",
+	finished.includes("8회") && finished.includes("tok") && finished.includes("npm test") && finished.includes("src/g.ts") && !finished.includes("그 이전"),
+	finished.slice(0, 300),
+);
+const perToolSends = calls
+	.slice(callsBefore)
+	.filter((call) => call.method === "sendMessage" && !String(call.params.text).includes(BOARD_MARK) && /<code>(read|bash|edit)<\/code>/.test(String(call.params.text)));
+check("detail 1 sends no separate message per tool", perToolSends.length === 0, JSON.stringify(perToolSends.map((call) => String(call.params.text).slice(0, 60))));
+
+pushMessage(CHAT, "/tg activity off");
+await waitFor("activity board switched off", () => textMessages("도구 게시판 off").length > 0);
+const quietSends = boardSends().length;
+idle = false;
+emit("agent_start", { type: "agent_start" });
+emit("turn_start", { type: "turn_start", turnIndex: 0 });
+emit("tool_execution_start", { type: "tool_execution_start", toolCallId: "quiet1", toolName: "read", args: { path: "src/quiet.ts" } });
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "quiet1", toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false, durationMs: 90 });
+emit("turn_end", { type: "turn_end", turnIndex: 0, message: { role: "assistant", usage: { input: 10, output: 5, totalTokens: 15 }, durationMs: 900 } });
+emit("agent_end", { type: "agent_end" });
+emit("agent_settled", { type: "agent_settled", aborted: false });
+idle = true;
+await waitFor("the last-moment summary arrives", () => boardSends().length > quietSends, 12_000);
+const quietBoard = boardSends().slice(quietSends);
+check(
+	"/tg activity off keeps only the turn-end summary",
+	quietBoard.length === 1 && String(quietBoard[0]?.params.text).includes("src/quiet.ts") && !boardEdits().some((call) => Number(call.params.message_id) === quietBoard[0]?.id),
+	JSON.stringify({ created: quietBoard.length, text: String(quietBoard[0]?.params.text).slice(0, 80) }),
+);
+pushMessage(CHAT, "/tg activity on");
+await waitFor("activity board switched back on", () => textMessages("도구 게시판 on").length > 0);
+
+// A turn_start that lands while the previous turn's tool handlers are still queued must not wipe
+// their notes, and an empty board must never reach the chat.
+const racedCalls = calls.length;
+idle = false;
+emit("tool_execution_start", { type: "tool_execution_start", toolCallId: "race1", toolName: "bash", args: { command: "echo raced tool" } });
+emit("turn_start", { type: "turn_start", turnIndex: 9 });
+emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "race1", toolName: "bash", result: { content: [{ type: "text", text: "raced tool" }] }, isError: false, durationMs: 40 });
+emit("turn_end", { type: "turn_end", turnIndex: 9, message: { role: "assistant", durationMs: 500 } });
+emit("agent_end", { type: "agent_end" });
+emit("agent_settled", { type: "agent_settled", aborted: false });
+idle = true;
+await waitFor("the raced tool still reaches the board", () => calls.slice(racedCalls).some((call) => String(call.params.text).includes("echo raced tool")), 12_000);
+check("a turn_start mid-flight does not lose the tool line", calls.slice(racedCalls).some((call) => String(call.params.text).includes("echo raced tool")), JSON.stringify(calls.slice(racedCalls).map((call) => String(call.params.text).slice(0, 40))));
+check("an empty board never reaches the chat", !calls.some((call) => String(call.params.text).includes(`${BOARD_MARK} · 0회`)), JSON.stringify(calls.filter((call) => String(call.params.text).includes(BOARD_MARK)).map((call) => String(call.params.text).slice(0, 40))));
 
 // 5. /model list + inline keyboard switches the model
 pushMessage(CHAT, "/model");
