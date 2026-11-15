@@ -319,6 +319,9 @@ const sessionEntries = [
 ];
 
 const notices: { message: string; level: string }[] = [];
+/** A rejection nobody caught is a bridge bug: it can end the pi process out from under the user. */
+const unhandled: string[] = [];
+process.on("unhandledRejection", (reason) => unhandled.push(reason instanceof Error ? reason.message : String(reason)));
 const statuses: Record<string, string | undefined> = {};
 const userMessages: { content: unknown; options?: { deliverAs?: string; expandPromptTemplates?: boolean } }[] = [];
 const execCalls: { command: string; args: string[] }[] = [];
@@ -1073,6 +1076,23 @@ pushMessage(CHAT, "/model");
 await waitFor("fresh model list", () => sentMessages("model").filter((call) => call.params.reply_markup).length >= 2);
 const stale = keyboardOf(sentMessages("model").filter((call) => call.params.reply_markup).at(-1)!).flat()[0].callback_data;
 commandHandlers.get("telegram")?.("chats", ctx); // no-op side effect only
+
+// pi throws when a ctx it invalidated (session replacement, /reload) is used again. A cosmetic
+// notice in the terminal must never be the thing that takes pi down.
+const liveNotify = (ctx as { ui: { notify: (message: string, level?: string) => void } }).ui.notify;
+let droppedNotices = 0;
+(ctx as unknown as { ui: { notify: () => void } }).ui.notify = () => {
+	droppedNotices += 1;
+	throw new Error("this extension ctx is stale after session replacement or reload");
+};
+const statsBefore = sentMessages("지연 통계").length;
+commandHandlers.get("telegram")?.("chats", ctx);
+commandHandlers.get("telegram-verbose")?.("2", ctx);
+commandHandlers.get("telegram-verbose")?.("1", ctx);
+(ctx as unknown as { ui: { notify: typeof liveNotify } }).ui.notify = liveNotify;
+check("a terminal notice from a dead ctx is swallowed, not fatal", droppedNotices >= 2, String(droppedNotices));
+pushMessage(CHAT, "/tg stats");
+await waitFor("the bridge still answers after a dead terminal ui", () => sentMessages("지연 통계").length > statsBefore, 12_000);
 const staleMessage = Number(sentMessages("model").at(-1)?.params.message_id ?? 0);
 pushCallback(CHAT, staleMessage, "t:k99999");
 await waitFor("expired toast", () => calls.some((call) => call.method === "answerCallbackQuery" && String(call.params.text ?? "").includes("만료")));
@@ -1753,6 +1773,7 @@ check("the config write leaves no temp copy of the token behind", !existsSync(`$
 const leakedTokens = tokenSamples.filter((token) => token && readFileSync(configPath, "utf8").includes(token));
 check("no keyboard tokens leak into config", leakedTokens.length === 0, `${tokenSamples.length} sampled, leaked: ${leakedTokens.slice(0, 2).join(",")}`);
 
+check("nothing the bridge does leaves an unhandled rejection", unhandled.length === 0, JSON.stringify(unhandled.slice(0, 3)));
 server.close();
 console.log(`\n${checks - failures}/${checks} checks passed · ${calls.length} Telegram API calls`);
 if (failures) {

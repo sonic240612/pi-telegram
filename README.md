@@ -328,6 +328,10 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   model, no provider key) is caught by a watchdog after 8s, and a run that finishes with nothing to
   show says so too. Provider errors are scanned for keys, bearer tokens and URL paths before they
   reach the chat (`redactSecrets`), and internal bridge errors go to the pi UI, the logs and the chats.
+* **A notification cannot kill pi.** A ctx that pi invalidated (reload, session replacement) throws
+  whenever it is used. Every cosmetic terminal notice goes through a guard, so a failed start or a
+  dropped “connected as …” message is logged and forgotten instead of becoming an unhandled rejection
+  that takes the pi process down.
 * **Serialization.** Updates are queued per chat, and outbound transcript events are processed in
   order, so an answer always arrives before its tool summary and one slow action cannot freeze the
   other chats.

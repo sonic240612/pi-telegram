@@ -305,7 +305,7 @@ export class TelegramBridge implements Hub {
 				const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 				switch (sub) {
 					case "status":
-						ctx.ui.notify(this.statusLine(), "info");
+						this.notifyUi(ctx, this.statusLine(), "info");
 						this.refreshStatus();
 						return;
 					case "start":
@@ -318,11 +318,11 @@ export class TelegramBridge implements Hub {
 						return;
 					case "token":
 						if (!rest[0]) {
-							ctx.ui.notify("usage: /telegram token <bot-token>", "warning");
+							this.notifyUi(ctx, "usage: /telegram token <bot-token>", "warning");
 							return;
 						}
 						this.setToken(rest[0]);
-						ctx.ui.notify("token saved to ~/.pi/agent/telegram.json", "info");
+						this.notifyUi(ctx, "token saved to ~/.pi/agent/telegram.json", "info");
 						await this.start();
 						return;
 					case "pair":
@@ -331,27 +331,27 @@ export class TelegramBridge implements Hub {
 					case "add": {
 						const chatId = Number(rest[0]);
 						if (!Number.isFinite(chatId)) {
-							ctx.ui.notify("usage: /telegram add <chatId>", "warning");
+							this.notifyUi(ctx, "usage: /telegram add <chatId>", "warning");
 							return;
 						}
 						this.addChat(chatId, this.chatTitles.get(chatId) ?? `chat ${chatId}`);
-						ctx.ui.notify(`paired ${chatId}`, "info");
+						this.notifyUi(ctx, `paired ${chatId}`, "info");
 						return;
 					}
 					case "chats":
-						ctx.ui.notify(this.chatsSummary() ?? "no paired chats", "info");
+						this.notifyUi(ctx, this.chatsSummary() ?? "no paired chats", "info");
 						return;
 					case "verbose": {
 						const level = Number(rest[0]);
 						if (level === 0 || level === 1 || level === 2) {
 							this.cfg.verbosity = level;
 							this.save();
-							ctx.ui.notify(`telegram detail level ${level}`, "info");
-						} else ctx.ui.notify("usage: /telegram verbose <0|1|2>", "warning");
+							this.notifyUi(ctx, `telegram detail level ${level}`, "info");
+						} else this.notifyUi(ctx, "usage: /telegram verbose <0|1|2>", "warning");
 						return;
 					}
 					default:
-						ctx.ui.notify("usage: /telegram status|start|stop|restart|token|pair|add|chats|verbose", "info");
+						this.notifyUi(ctx, "usage: /telegram status|start|stop|restart|token|pair|add|chats|verbose", "info");
 				}
 			},
 		});
@@ -362,7 +362,7 @@ export class TelegramBridge implements Hub {
 				this.eventCtx = ctx;
 				const token = args.trim().split(/\s+/)[0];
 				if (!token) {
-					ctx.ui.notify("usage: /telegram-setup <bot-token>", "warning");
+					this.notifyUi(ctx, "usage: /telegram-setup <bot-token>", "warning");
 					return;
 				}
 				this.setToken(token);
@@ -382,12 +382,12 @@ export class TelegramBridge implements Hub {
 				}
 				const match = pending.find((entry) => entry.code === code);
 				if (!match) {
-					ctx.ui.notify(`no pending chat with code ${code}`, "warning");
+					this.notifyUi(ctx, `no pending chat with code ${code}`, "warning");
 					this.listPending(ctx);
 					return;
 				}
 				this.approvePending(match);
-				ctx.ui.notify(`paired ${match.label} (${match.chatId})`, "info");
+				this.notifyUi(ctx, `paired ${match.label} (${match.chatId})`, "info");
 				await this.sendHtml(match.chatId, "✅ pairing approved — 텍스트는 이제 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.").catch(() => undefined);
 			},
 		});
@@ -396,7 +396,7 @@ export class TelegramBridge implements Hub {
 			description: "List paired Telegram chats",
 			handler: async (_args, ctx) => {
 				this.eventCtx = ctx;
-				ctx.ui.notify(this.chatsSummary() ?? "no paired chats", "info");
+				this.notifyUi(ctx, this.chatsSummary() ?? "no paired chats", "info");
 			},
 		});
 
@@ -408,8 +408,8 @@ export class TelegramBridge implements Hub {
 				if (level === 0 || level === 1 || level === 2) {
 					this.cfg.verbosity = level;
 					this.save();
-					ctx.ui.notify(`telegram detail level ${level}`, "info");
-				} else ctx.ui.notify("usage: /telegram-verbose <0|1|2>", "warning");
+					this.notifyUi(ctx, `telegram detail level ${level}`, "info");
+				} else this.notifyUi(ctx, "usage: /telegram-verbose <0|1|2>", "warning");
 			},
 		});
 	}
@@ -417,10 +417,10 @@ export class TelegramBridge implements Hub {
 	private listPending(ctx: ExtensionContext): void {
 		const pending = [...this.pending.values()];
 		if (!pending.length) {
-			ctx.ui.notify('no pending Telegram chats. Have someone send the bot any message, then approve here with "/telegram-pair <code>".', "info");
+			this.notifyUi(ctx, 'no pending Telegram chats. Have someone send the bot any message, then approve here with "/telegram-pair <code>".', "info");
 			return;
 		}
-		for (const entry of pending) ctx.ui.notify(`pending: ${entry.label} (${entry.chatId}) → code ${entry.code} — approve with /telegram-pair ${entry.code}`, "info");
+		for (const entry of pending) this.notifyUi(ctx, `pending: ${entry.label} (${entry.chatId}) → code ${entry.code} — approve with /telegram-pair ${entry.code}`, "info");
 	}
 
 	private registerTools(): void {
@@ -449,7 +449,7 @@ export class TelegramBridge implements Hub {
 					if (!existsSync(resolved)) return { content: [{ type: "text", text: `telegram_send: file not found: ${resolved}` }], details: sendDetails(sent) };
 					const data = Uint8Array.from(readFileSync(resolved));
 					// Any file pi can read can leave this machine through this tool. Say so in the terminal.
-					this.eventCtx?.ui.notify(`telegram_send attached ${resolved} (${formatBytes(data.byteLength)}) to ${this.chats().length} chat(s)`, "info");
+					this.notifyUi(this.eventCtx, `telegram_send attached ${resolved} (${formatBytes(data.byteLength)}) to ${this.chats().length} chat(s)`, "info");
 					for (const chatId of this.chats()) {
 						try {
 							await this.sendFile(chatId, data, basename(resolved), params.caption);
@@ -528,7 +528,7 @@ export class TelegramBridge implements Hub {
 	async start(): Promise<{ ok: boolean; error?: string }> {
 		const token = resolveToken(this.cfg);
 		if (!token) {
-			this.eventCtx?.ui.notify("telegram: no token. run /telegram-setup <bot-token> or set TELEGRAM_BOT_TOKEN.", "warning");
+			this.notifyUi(this.eventCtx, "telegram: no token. run /telegram-setup <bot-token> or set TELEGRAM_BOT_TOKEN.", "warning");
 			return { ok: false, error: "no token configured" };
 		}
 		// Everything this bridge writes to chats, files and stderr is scrubbed of the token from here on:
@@ -552,10 +552,10 @@ export class TelegramBridge implements Hub {
 				await this.broadcast(`🟢 <b>${escapeHtml(displayName(me))}</b> · pi 연결됨\n${this.cfg.chats.length} chat(s) · detail ${this.cfg.verbosity} · drafts ${this.cfg.streaming ? "on" : "off"}`, { markdown: false });
 			}
 			await this.flushPendingNotice();
-			this.eventCtx?.ui.notify(`telegram bridge connected as ${displayName(me)}`, "info");
+			this.notifyUi(this.eventCtx, `telegram bridge connected as ${displayName(me)}`, "info");
 			return { ok: true };
 		} catch (error) {
-			this.eventCtx?.ui.notify(`telegram start failed: ${errorMessage(error)}${error instanceof TelegramError && /unauthorized/i.test(error.message) ? " — check the token (/telegram token <new>)" : ""}`, "error");
+			this.notifyUi(this.eventCtx, `telegram start failed: ${errorMessage(error)}${error instanceof TelegramError && /unauthorized/i.test(error.message) ? " — check the token (/telegram token <new>)" : ""}`, "error");
 			return { ok: false, error: errorMessage(error) };
 		}
 	}
@@ -648,6 +648,20 @@ export class TelegramBridge implements Hub {
 		writeConfigNow(this.cfg);
 	}
 
+	/**
+	 * Tell the terminal something, without ever letting the telling be the thing that crashes pi. A ctx
+	 * captured before a session replacement or a reload is invalid, and pi throws when it is used —
+	 * losing a cosmetic notice is a much better outcome than losing the process.
+	 */
+	private notifyUi(ctx: { ui: { notify(message: string, severity?: "info" | "warning" | "error"): void } } | undefined, message: string, severity?: "info" | "warning" | "error"): void {
+		try {
+			ctx?.ui.notify(message, severity);
+		} catch {
+			/* stale ctx — the session moved on; keep stderr informed and carry on */
+			this.dbg("dropped terminal notice:", message);
+		}
+	}
+
 	/** --telegram-off: never connect automatically, but /telegram start still works. */
 	disable(): void {
 		this.disabled = true;
@@ -656,7 +670,7 @@ export class TelegramBridge implements Hub {
 
 	private async autoStart(): Promise<void> {
 		if (this.disabled || !resolveToken(this.cfg)) return;
-		await this.start();
+		await this.start().catch((error) => this.notifyUi(this.eventCtx, `telegram start failed: ${errorMessage(error)}`, "error"));
 	}
 
 	private async runPollLoop(signal: AbortSignal): Promise<void> {
@@ -681,11 +695,11 @@ export class TelegramBridge implements Hub {
 				if (signal.aborted) return;
 				failures += 1;
 				if (error instanceof TelegramError && error.code === 409) {
-					this.eventCtx?.ui.notify("telegram: 409 conflict — another poller or a webhook already uses this token.", "warning");
+					this.notifyUi(this.eventCtx, "telegram: 409 conflict — another poller or a webhook already uses this token.", "warning");
 					await sleep(5000);
 					continue;
 				}
-				if (failures === 3) this.eventCtx?.ui.notify(`telegram connection trouble: ${errorMessage(error)}`, "warning");
+				if (failures === 3) this.notifyUi(this.eventCtx, `telegram connection trouble: ${errorMessage(error)}`, "warning");
 				await sleep(Math.min(20_000, 1000 * 2 ** Math.min(failures, 5)));
 			}
 		}
@@ -808,7 +822,7 @@ export class TelegramBridge implements Hub {
 		if (entry && codeMatch && entry.code === codeMatch[1]) {
 			this.approvePending(entry);
 			await this.sendHtml(chatId, "✅ paired! 텍스트는 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.");
-			this.eventCtx?.ui.notify(`telegram paired: ${label} (${chatId})`, "info");
+			this.notifyUi(this.eventCtx, `telegram paired: ${label} (${chatId})`, "info");
 			return;
 		}
 		if (entry && codeMatch) {
@@ -818,7 +832,7 @@ export class TelegramBridge implements Hub {
 				entry.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS;
 				entry.code = randomCode();
 				entry.attempts = 0;
-				this.eventCtx?.ui.notify(
+				this.notifyUi(this.eventCtx, 
 					`telegram: ${label} (${chatId}) guessed pairing codes ${PAIR_MAX_ATTEMPTS} times — code rotated, chat on cooldown for ${PAIR_COOLDOWN_MS / 60_000} minutes`,
 					"warning",
 				);
@@ -836,7 +850,7 @@ export class TelegramBridge implements Hub {
 			chatId,
 			`🔒 <b>pairing 필요</b>\npi 운영자가 pi 터미널에서 확인해야 합니다:\n1. <code>/telegram-pair</code> → 대기 목록과 코드 확인\n2. pi에서 <code>/telegram-pair &lt;code&gt;</code> 실행\n\n또는 운영자가 보내준 ${PAIR_CODE_RANGE[0].toString().length}자리 코드를 여기에 입력하면 허용됩니다.`,
 		);
-		this.eventCtx?.ui.notify(`telegram pairing request: ${label} (${chatId}) → code ${fresh.code} (approve with /telegram-pair ${fresh.code})`, "info");
+		this.notifyUi(this.eventCtx, `telegram pairing request: ${label} (${chatId}) → code ${fresh.code} (approve with /telegram-pair ${fresh.code})`, "info");
 	}
 
 	private approvePending(entry: PendingChat): void {
@@ -1090,7 +1104,7 @@ export class TelegramBridge implements Hub {
 			// session, unpair a chat.
 			await this.bot?.answerCallbackQuery(query.id, "이 버튼은 다른 채팅에서 열린 거예요", true);
 			this.dbg("callback token from the wrong chat", chatId, "->", entry.chatId);
-			this.eventCtx?.ui.notify(`telegram: ignored a keyboard tap from chat ${chatId} — that button belongs to ${entry.chatId}`, "warning");
+			this.notifyUi(this.eventCtx, `telegram: ignored a keyboard tap from chat ${chatId} — that button belongs to ${entry.chatId}`, "warning");
 			return;
 		}
 		if (entry.action.kind === "ask:answer") {
@@ -1115,7 +1129,7 @@ export class TelegramBridge implements Hub {
 			else this.dropToken(token);
 		} catch (error) {
 			await this.bot?.answerCallbackQuery(query.id, "실패", true);
-			this.eventCtx?.ui.notify(`telegram callback failed: ${errorMessage(error)}`, "warning");
+			this.notifyUi(this.eventCtx, `telegram callback failed: ${errorMessage(error)}`, "warning");
 		}
 	}
 
@@ -1191,7 +1205,7 @@ export class TelegramBridge implements Hub {
 	}
 
 	notify(text: string, level: "info" | "warning" = "info"): void {
-		this.eventCtx?.ui.notify(text, level);
+		this.notifyUi(this.eventCtx, text, level);
 	}
 
 	observeGoal(result: unknown): string | undefined {
@@ -1708,7 +1722,7 @@ export class TelegramBridge implements Hub {
 			this.menuShadowed = ours.some((name) => !this.menuServed.includes(name));
 			if (this.menuShadowed) {
 				const foreign = this.menuServed.filter((name) => !ours.includes(name));
-				this.eventCtx?.ui.notify(
+				this.notifyUi(this.eventCtx, 
 					`telegram 메뉴가 다른 프로그램에 의해 덮어써졌어요 — 같은 토큰을 쓰는 다른 pi/브리지 프로세스를 끄고 /tg menu 로 다시 등록하세요 (다른 목록 ${foreign.length}개: ${foreign.slice(0, 6).join(", ")})`,
 					"warning",
 				);
@@ -1757,7 +1771,7 @@ export class TelegramBridge implements Hub {
 		this.lastError = `${where}: ${detail}`;
 		const stack = error instanceof Error ? error.stack : undefined;
 		console.error(`pi-telegram: ${where} failed: ${redactSecrets(detail)}${stack ? `\n${redactSecrets(stack)}` : ""}`);
-		this.eventCtx?.ui.notify(`pi-telegram ${where} failed: ${redactSecrets(detail)}`, "warning");
+		this.notifyUi(this.eventCtx, `pi-telegram ${where} failed: ${redactSecrets(detail)}`, "warning");
 		if (this.lastErrorShownAt.get(where) !== Date.now()) {
 			this.lastErrorShownAt.set(where, Date.now());
 			void this.broadcast(`⚠️ <i>${escapeHtml(redactSecrets(`${where}: ${detail}`))}</i>`, { markdown: false, silent: true }).catch(() => undefined);
