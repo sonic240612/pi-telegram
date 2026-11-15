@@ -581,6 +581,16 @@ send(CHAT, "/compact");
 const compactWindow = replies().length;
 const compactNoticeSeen = await waitFor(() => replies().slice(compactWindow).some((text) => /컨텍스트 압축 (중|완료|실패|중단)/.test(text)), 10_000);
 check("the chat is told what happened to the compaction", compactNoticeSeen, scrub(replies().slice(compactWindow).join(" | ")).slice(0, 200));
+// replies() flattens whitespace, so look at the raw payloads: the complaint to guard against is a
+// notice whose last line carries the trigger and another clause, which reads as one run-on sentence.
+const rawCompaction = calls
+	.filter((call) => call.method === "sendMessage" && /컨텍스트 압축 (중|완료|실패|중단)/.test(String(call.params.text ?? "")))
+	.map((call) => String(call.params.text ?? ""));
+check(
+	"a compaction notice gives every fact its own line",
+	rawCompaction.length > 0 && rawCompaction.every((text) => text.includes("· 트리거: ") && text.split("\n").slice(1).every((line) => line.startsWith("· ") && !line.slice(2).includes(" · ") && !line.includes("), ") && !/compaction failed/i.test(line))),
+	JSON.stringify((rawCompaction.at(-1) ?? "").split("\n")),
+);
 await sleep(600);
 const beforeCompaction = replies().length;
 send(CHAT, "a message sent right around compaction");

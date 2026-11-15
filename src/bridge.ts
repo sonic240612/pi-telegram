@@ -891,24 +891,34 @@ export class TelegramBridge implements Hub {
 	/** pi blocks prompts while it compacts, so the chat is told what it is waiting for. */
 	private async announceCompaction(reason: CompactionReason, willRetry: boolean): Promise<void> {
 		const usage = this.eventCtx?.getContextUsage();
-		const size = usage?.tokens != null ? ` · ${formatCount(usage.tokens)} tokens${usage.percent != null ? ` · ${Math.round(usage.percent)}%` : ""}` : "";
-		const held = this.heldPrompts.length ? `\n· 이미 보낸 메시지 ${this.heldPrompts.length}개는 압축이 끝나면 자동으로 전달돼요.` : "";
-		await this.broadcast(`🗜 <i>컨텍스트 압축 중…</i>${size}\n· ${compactionReasonLabel(reason)}${willRetry ? " · 압축 후 지금 턴을 다시 시도해요" : ""}${held}`, { markdown: false });
+		// One fact per line. These notices used to stack the trigger and a follow-up clause on one
+		// line, which on a phone read as a sentence with another sentence glued to its end.
+		const lines = [`🗜 <i>컨텍스트 압축 중…</i>`];
+		if (usage?.tokens != null) lines.push(`· ${formatCount(usage.tokens)} tokens${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}`);
+		lines.push(`· 트리거: ${compactionReasonLabel(reason)}`);
+		if (willRetry) lines.push("· 압축이 끝나면 지금 턴을 다시 시도해요.");
+		if (this.heldPrompts.length) lines.push(`· 이미 보낸 메시지 ${this.heldPrompts.length}개는 압축이 끝나면 자동으로 전달돼요.`);
+		await this.broadcast(lines.join("\n"), { markdown: false });
 	}
 
 	private async announceCompactionDone(entry: { tokensBefore?: number } | undefined, reason: CompactionReason): Promise<void> {
-		const seconds = this.compactingAt ? ` · ${((Date.now() - this.compactingAt) / 1000).toFixed(1)}s` : "";
+		const elapsed = this.compactingAt ? ((Date.now() - this.compactingAt) / 1000).toFixed(1) : undefined;
 		this.compactingAt = 0;
 		const before = typeof entry?.tokensBefore === "number" ? formatCount(entry.tokensBefore) : undefined;
 		const after = this.eventCtx?.getContextUsage()?.tokens;
-		const delta = before ? ` · ${before} → ${after != null ? formatCount(after) : "요약"}` : "";
-		await this.broadcast(`✅ <i>컨텍스트 압축 완료</i>${delta}${seconds}\n· ${compactionReasonLabel(reason)}`, { markdown: false });
+		const lines = [`✅ <i>컨텍스트 압축 완료</i>`];
+		if (before) lines.push(`· ${before} → ${after != null ? formatCount(after) : "요약"}`);
+		if (elapsed) lines.push(`· ${elapsed}초 걸림`);
+		lines.push(`· 트리거: ${compactionReasonLabel(reason)}`);
+		await this.broadcast(lines.join("\n"), { markdown: false });
 	}
 
 	private async announceCompactionFailed(event: { aborted: boolean; errorMessage?: string; reason: CompactionReason }): Promise<void> {
 		this.compactingAt = 0;
-		const detail = event.errorMessage ? `: ${escapeHtml(truncate(redactSecrets(event.errorMessage), 300))}` : "";
-		await this.broadcast(`⚠️ <i>컨텍스트 압축 ${event.aborted ? "중단" : "실패"}</i>${detail}\n· ${compactionReasonLabel(event.reason)}`, { markdown: false });
+		const detail = cleanCompactionError(event.errorMessage);
+		const lines = [`⚠️ <i>컨텍스트 압축 ${event.aborted ? "중단" : "실패"}</i>`, `· 트리거: ${compactionReasonLabel(event.reason)}`];
+		if (detail) lines.push(`· 오류: ${escapeHtml(truncate(redactSecrets(detail), 300))}`);
+		await this.broadcast(lines.join("\n"), { markdown: false });
 	}
 
 	private releaseContextBusy(reason: string): void {
@@ -1856,6 +1866,16 @@ type CompactionReason = "manual" | "threshold" | "overflow";
 function compactionReasonLabel(reason: CompactionReason): string {
 	if (reason === "manual") return "/compact로 시작";
 	return reason === "threshold" ? "컨텍스트 임계값에 도달해서 자동" : "컨텍스트를 넘겨서 자동 복구";
+}
+
+/**
+ * pi already says what went wrong, and its text usually starts with its own "Compaction failed:".
+ * We print 실패 one line above, so keeping that prefix tells the user the same thing twice.
+ */
+function cleanCompactionError(message?: string): string | undefined {
+	if (!message) return undefined;
+	const cleaned = message.trim().replace(/^(?:compaction|compact)\s+failed\s*[:.–-]?\s*/i, "");
+	return cleaned || undefined;
 }
 
 function sameLocation(a: string, b: string): boolean {
