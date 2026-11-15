@@ -1383,7 +1383,7 @@ const compactNotice = await waitFor("compacting notice", () => sentMessages("컨
 	() => undefined,
 );
 check("the chat is told pi is rebuilding its context", Boolean(compactNotice), "no 🗜 notice");
-check("the compaction notice says what triggered it and how big the context is", /42\.0k tokens/.test(String(compactNotice?.params.text ?? "")) && String(compactNotice?.params.text ?? "").includes("/compact로 시작"), shapeText(String(compactNotice?.params.text ?? "")));
+check("the compaction notice says what triggered it and how big the context is", /42\.0k tokens/.test(String(compactNotice?.params.text ?? "")) && String(compactNotice?.params.text ?? "").includes("/compact"), shapeText(String(compactNotice?.params.text ?? "")));
 // A phone shows the notice as a bubble: two clauses on one line read as a run-on sentence.
 const compactNoticeLines = String(compactNotice?.params.text ?? "").split("\n");
 check("the compaction notice keeps one fact per line", compactNoticeLines.length >= 3 && compactNoticeLines.slice(1).every((line) => !line.includes(" · ") && !line.includes("), ")), JSON.stringify(compactNoticeLines));
@@ -1398,7 +1398,7 @@ const compactDone = await waitFor("compaction done notice", () => sentMessages("
 );
 check("the chat learns the compaction finished and how much it saved", String(compactDone?.params.text ?? "").includes("45.0k → 42.0k"), shapeText(String(compactDone?.params.text ?? "")));
 const compactDoneLines = String(compactDone?.params.text ?? "").split("\n");
-check("the finished notice names the trigger on its own last line", /· 트리거: \/compact로 시작$/.test(compactDoneLines.at(-1) ?? "") && compactDoneLines.slice(1, -1).every((line) => !line.includes(" · ")), JSON.stringify(compactDoneLines));
+check("the finished notice names the trigger on its own last line", /· \/compact$/.test(compactDoneLines.at(-1) ?? "") && compactDoneLines.slice(1, -1).every((line) => !line.includes(" · ")), JSON.stringify(compactDoneLines));
 await waitFor("held prompt delivered after compaction", () => userMessages.length > promptsBeforeCompaction, 8000);
 check("the parked prompt reaches pi once compaction finishes", userMessages.length > promptsBeforeCompaction);
 await waitFor("flush notice", () => sentMessages("압축 끝 — 기다리던 메시지").length > 0);
@@ -1411,10 +1411,10 @@ const compactFailed = await waitFor("compaction failure notice", () => sentMessa
 );
 check("a failed compaction is reported, not left silent", String(compactFailed?.params.text ?? "").includes("provider said no") && String(compactFailed?.params.text ?? "").includes("컨텍스트 임계값"), shapeText(String(compactFailed?.params.text ?? "")));
 const compactFailedLines = String(compactFailed?.params.text ?? "").split("\n");
-check("the trigger and pi's own error each get their own line", compactFailedLines[1] === "· 트리거: 컨텍스트 임계값에 도달해서 자동" && String(compactFailedLines[2] ?? "").startsWith("· 오류: provider said no"), JSON.stringify(compactFailedLines));
+check("the trigger and pi's own error each get their own line", compactFailedLines[1] === "· 컨텍스트 임계값에 도달해서 자동 압축" && String(compactFailedLines[2] ?? "").startsWith("· 오류: provider said no"), JSON.stringify(compactFailedLines));
 check("pi's own “Compaction failed:” prefix is not repeated below our 실패 line", !String(compactFailed?.params.text ?? "").toLowerCase().includes("compaction failed"), shapeText(String(compactFailed?.params.text ?? "")));
 const autoStartLines = String(sentMessages("컨텍스트 압축 중").at(-1)?.params.text ?? "").split("\n");
-check("the retry clause is a line of its own, not a tail on the trigger", autoStartLines.includes("· 트리거: 컨텍스트 임계값에 도달해서 자동") && autoStartLines.includes("· 압축이 끝나면 지금 턴을 다시 시도해요."), JSON.stringify(autoStartLines));
+check("the retry clause is a line of its own, not a tail on the trigger", autoStartLines.includes("· 컨텍스트 임계값에 도달해서 자동 압축") && autoStartLines.includes("· 압축이 끝나면 지금 턴을 다시 시도해요."), JSON.stringify(autoStartLines));
 const promptsAfterFailedCompaction = userMessages.length;
 pushMessage(CHAT, "압축 실패 후에도 보내지는 메시지");
 await waitFor("prompt after failed compaction", () => userMessages.length > promptsAfterFailedCompaction, 8000);

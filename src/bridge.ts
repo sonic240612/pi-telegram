@@ -922,7 +922,7 @@ export class TelegramBridge implements Hub {
 		// line, which on a phone read as a sentence with another sentence glued to its end.
 		const lines = [`🗜 <i>컨텍스트 압축 중…</i>`];
 		if (usage?.tokens != null) lines.push(`· ${formatCount(usage.tokens)} tokens${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}`);
-		lines.push(`· 트리거: ${compactionReasonLabel(reason)}`);
+		lines.push(`· ${compactionReasonLabel(reason)}`);
 		if (willRetry) lines.push("· 압축이 끝나면 지금 턴을 다시 시도해요.");
 		if (this.heldPrompts.length) lines.push(`· 이미 보낸 메시지 ${this.heldPrompts.length}개는 압축이 끝나면 자동으로 전달돼요.`);
 		await this.broadcast(lines.join("\n"), { markdown: false });
@@ -936,14 +936,14 @@ export class TelegramBridge implements Hub {
 		const lines = [`✅ <i>컨텍스트 압축 완료</i>`];
 		if (before) lines.push(`· ${before} → ${after != null ? formatCount(after) : "요약"}`);
 		if (elapsed) lines.push(`· ${elapsed}초 걸림`);
-		lines.push(`· 트리거: ${compactionReasonLabel(reason)}`);
+		lines.push(`· ${compactionReasonLabel(reason)}`);
 		await this.broadcast(lines.join("\n"), { markdown: false });
 	}
 
 	private async announceCompactionFailed(event: { aborted: boolean; errorMessage?: string; reason: CompactionReason }): Promise<void> {
 		this.compactingAt = 0;
 		const detail = cleanCompactionError(event.errorMessage);
-		const lines = [`⚠️ <i>컨텍스트 압축 ${event.aborted ? "중단" : "실패"}</i>`, `· 트리거: ${compactionReasonLabel(event.reason)}`];
+		const lines = [`⚠️ <i>컨텍스트 압축 ${event.aborted ? "중단" : "실패"}</i>`, `· ${compactionReasonLabel(event.reason)}`];
 		if (detail) lines.push(`· 오류: ${escapeHtml(truncate(redactSecrets(detail), 300))}`);
 		await this.broadcast(lines.join("\n"), { markdown: false });
 	}
@@ -1891,10 +1891,13 @@ function displayName(user: { username?: string; first_name?: string }): string {
 /** Compare paths across separators and drive letters: pi stores session cwds from any platform. */
 type CompactionReason = "manual" | "threshold" | "overflow";
 
-/** pi tells us what triggered a compaction; the chat should not have to guess. */
+/**
+ * pi tells us what triggered a compaction; the chat should not have to guess. Each label is a phrase
+ * that reads on its own, because it stands on a line of its own in the notice.
+ */
 function compactionReasonLabel(reason: CompactionReason): string {
-	if (reason === "manual") return "/compact로 시작";
-	return reason === "threshold" ? "컨텍스트 임계값에 도달해서 자동" : "컨텍스트를 넘겨서 자동 복구";
+	if (reason === "manual") return "/compact";
+	return reason === "threshold" ? "컨텍스트 임계값에 도달해서 자동 압축" : "컨텍스트를 넘겨서 자동 압축 후 재시도";
 }
 
 /**

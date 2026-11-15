@@ -588,7 +588,15 @@ const rawCompaction = calls
 	.map((call) => String(call.params.text ?? ""));
 check(
 	"a compaction notice gives every fact its own line",
-	rawCompaction.length > 0 && rawCompaction.every((text) => text.includes("· 트리거: ") && text.split("\n").slice(1).every((line) => line.startsWith("· ") && !line.slice(2).includes(" · ") && !line.includes("), ") && !/compaction failed/i.test(line))),
+	rawCompaction.length > 0 &&
+		rawCompaction.every((text) => {
+			const lines = text.split("\n");
+			return (
+				lines.length >= 3 &&
+				lines.slice(1).every((line) => line.startsWith("· ") && !line.slice(2).includes(" · ") && !line.includes("), ") && !/compaction failed|트리거:/i.test(line)) &&
+				lines.some((line) => /^· (\/compact|컨텍스트)/u.test(line))
+			);
+		}),
 	JSON.stringify((rawCompaction.at(-1) ?? "").split("\n")),
 );
 await sleep(600);
