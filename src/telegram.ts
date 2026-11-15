@@ -10,6 +10,8 @@ export interface TgUser {
 	first_name?: string;
 	last_name?: string;
 	username?: string;
+	/** Language of this user's Telegram client, e.g. "ko", "en-US", "ja". */
+	language_code?: string;
 }
 
 export interface TgChat {

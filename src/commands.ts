@@ -9,6 +9,8 @@
 import type { CallbackActionKind, CallbackEntry, CallbackResult, Hub, ListSpec, SendOptions } from "./hub.ts";
 import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, tgDebug, truncate } from "./format.ts";
 import { goalCardHtml, goalStatusLabel } from "./goal.ts";
+import { L, pick } from "./i18n.ts";
+import type { Localized } from "./i18n.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface CommandInvocation {
@@ -184,7 +186,7 @@ export class CommandLayer {
 			["모델·도구", "/model [이름·검색어] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<이름>]"],
 			["실행 제어", "/abort · /steer <메시지> · /queue <메시지> · /bash <셸 명령>"],
 			["상태·표시", "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal"],
+			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal|lang"],
 		];
 		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
 		const notes = [
@@ -493,6 +495,54 @@ export class CommandLayer {
 		);
 	}
 
+	/** What language this chat hears, why, and how to change it. */
+	private async language(chatId: number, args: string): Promise<void> {
+		const raw = args.trim().toLowerCase();
+		if (raw === "auto") {
+			this.hub.setLang(chatId, undefined);
+			await this.say(
+				chatId,
+				L(
+					`🌐 이 채팅의 언어 고정을 풀었어요 — 다시 자동 감지하고, 지금 바로 ${inlineCode(this.hub.lang(chatId))}로 말해요.`,
+					`🌐 released this chat's language pin — it follows detection again and speaks ${inlineCode(this.hub.lang(chatId))} right now.`,
+				),
+			);
+			return;
+		}
+		if (raw === "ko" || raw === "en") {
+			this.hub.setLang(chatId, raw);
+			// Answer in the language that was just picked: that is the proof it took effect.
+			await this.say(
+				chatId,
+			raw === "ko"
+					? `🌐 <b>이 채팅은 이제 한국어로 말해요</b> — 브리지가 쓰는 메뉴·알림이 한국어로 바뀝니다. 답장 본문은 pi가 답하는 언어를 따라가요. · 되돌리기: ${inlineCode("/tg lang auto")}`
+					: `🌐 <b>This chat now hears me in English</b> — the bridge's menus and notices switch to English. Answers still follow whatever language pi replies in. · to undo: ${inlineCode("/tg lang auto")}`,
+			);
+			return;
+		}
+		if (raw) {
+			await this.say(chatId, L(`모르는 언어예요 — ${inlineCode("/tg lang ko|en|auto")}`, `unknown language — ${inlineCode("/tg lang ko|en|auto")}`));
+			return;
+		}
+		const lang = this.hub.lang(chatId);
+		const source = this.hub.langSource(chatId);
+		// One string, not a Localized inside a Localized: interpolating a function would paste its source.
+		const why =
+			source === "chat"
+				? pick(lang, `· 이 채팅에서 고정한 값 — ${inlineCode("/tg lang auto")}로 자동 감지로 되돌려요`, `· pinned for this chat — ${inlineCode("/tg lang auto")} hands it back to detection`)
+				: source === "config"
+					? pick(lang, `· ${inlineCode("telegram.json")}의 ${inlineCode("language")}로 고정 — 채팅별로 ${inlineCode("/tg lang ko|en")}로 바꿀 수 있어요`, `· fixed by ${inlineCode("language")} in ${inlineCode("telegram.json")} — ${inlineCode("/tg lang ko|en")} overrides it per chat`)
+					: source === "telegram"
+						? pick(lang, `· 텔레그램이 알려준 클라이언트 언어로 자동 감지 — ${inlineCode("/tg lang ko|en")}로 고칠 수 있어요`, `· detected from the language telegram reports for your client — override with ${inlineCode("/tg lang ko|en")}`)
+						: pick(lang, `· 아직 이 채팅의 언어 신호를 못 봤어요 — 기본값은 영어`, `· no language signal from this chat yet — the fallback is English`);
+		await this.say(
+			chatId,
+			lang === "ko"
+				? `🌐 이 채팅에 쓰는 언어: <b>한국어</b>\n${why}\n<i>${inlineCode("/tg lang ko|en|auto")} · 브리지만 한국어/영어, pi 답장은 모델이 답하는 언어</i>`
+				: `🌐 Language for this chat: <b>English</b>\n${why}\n<i>${inlineCode("/tg lang ko|en|auto")} · only the bridge speaks Korean/English; pi's answers come in whatever language pi replies</i>`,
+		);
+	}
+
 	/** How hard the bridge scrubs credentials from the copies it makes for Telegram. */
 	private async redact(chatId: number, args: string): Promise<void> {
 		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -568,6 +618,9 @@ export class CommandLayer {
 				return this.stream(chatId, rest);
 			case "activity":
 				return this.activity(chatId, rest);
+			case "lang":
+			case "language":
+				return this.language(chatId, rest);
 			case "redact":
 				return this.redact(chatId, rest);
 			case "stats":
@@ -581,7 +634,7 @@ export class CommandLayer {
 				return this.say(chatId, goalCardHtml(state.goal, state.focus));
 			}
 			default:
-				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal")}`);
+				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal")}`);
 		}
 	}
 
@@ -932,7 +985,7 @@ export class CommandLayer {
 	}
 
 	/** Command replies are built as Telegram HTML, so they skip markdown conversion. */
-	private async say(chatId: number, html: string, options?: SendOptions): Promise<void> {
+	private async say(chatId: number, html: Localized, options?: SendOptions): Promise<void> {
 		await this.hub.send(chatId, html, { markdown: false, ...options });
 	}
 

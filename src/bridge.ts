@@ -15,6 +15,8 @@ import { QuestionnaireBridge, type EventBusLike } from "./questions.ts";
 import { escapeHtml, formatBytes, formatCount, redactSecrets, registerSecret, scrubKnownSecrets, splitLongLine, tgDebug, toHtmlChunks, truncate } from "./format.ts";
 import type { CallbackAction, CallbackEntry, Hub, ModelLike, SendOptions, ShellResult, SessionInfoLike } from "./hub.ts";
 import { CALLBACK_PREFIX, stripCallbackPrefix } from "./hub.ts";
+import type { Lang, Localized } from "./i18n.ts";
+import { langFromTelegramCode, render } from "./i18n.ts";
 import { OutboundMirror } from "./mirror.ts";
 import { listPromptEntries, listSessions } from "./session-index.ts";
 import type { SessionSummary } from "./session-index.ts";
@@ -99,6 +101,8 @@ export class TelegramBridge implements Hub {
 	private echoes = new Map<string, number>();
 	private pending = new Map<number, PendingChat>();
 	private chatTitles = new Map<number, string>();
+	/** Language Telegram reports for each chat's user, kept even before that chat is paired. */
+	private seenLang = new Map<number, Lang>();
 
 	private disabled = false;
 	/** In-flight teardown, so a session_start that races a shutdown reconnects instead of doing nothing. */
@@ -752,7 +756,24 @@ export class TelegramBridge implements Hub {
 		const chatId = message.chat.id;
 		const label = message.chat.title ?? [message.chat.first_name, message.chat.last_name].filter(Boolean).join(" ") ?? message.chat.username ?? `chat ${chatId}`;
 		this.chatTitles.set(chatId, label);
+		this.noteClientLanguage(chatId, message.from?.language_code);
 		return label;
+	}
+
+	/**
+	 * Telegram names the language of the user's client on every update. It is the only honest signal we
+	 * have about how to sound to this person, so remember it — on the chat record when there is one, so
+	 * a restart does not change the language half way through somebody's week.
+	 */
+	private noteClientLanguage(chatId: number, code: string | undefined): void {
+		const lang = langFromTelegramCode(code);
+		if (!lang) return;
+		if (this.seenLang.get(chatId) !== lang) this.seenLang.set(chatId, lang);
+		const record = this.cfg.chats.find((chat) => chat.chatId === chatId);
+		if (record && record.tgLang !== lang) {
+			record.tgLang = lang;
+			this.save();
+		}
 	}
 
 	private async handleMessage(message: TgMessage, edited: boolean): Promise<void> {
@@ -860,7 +881,7 @@ export class TelegramBridge implements Hub {
 
 	private addChat(chatId: number, label: string): void {
 		if (this.cfg.chats.some((chat) => chat.chatId === chatId)) return;
-		const record: TelegramChatRecord = { chatId, label, addedAt: Date.now() };
+		const record: TelegramChatRecord = { chatId, label, addedAt: Date.now(), tgLang: this.seenLang.get(chatId) };
 		this.cfg.chats.push(record);
 		writeConfigNow(this.cfg);
 	}
@@ -1082,6 +1103,7 @@ export class TelegramBridge implements Hub {
 	private async handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
 		const data = query.data ?? "";
 		const chatId = query.message?.chat.id ?? 0;
+		this.noteClientLanguage(chatId, query.from?.language_code);
 		if (!data.startsWith(CALLBACK_PREFIX)) {
 			await this.bot?.answerCallbackQuery(query.id);
 			return;
@@ -1135,11 +1157,13 @@ export class TelegramBridge implements Hub {
 
 	// ------------------------------------------------------------- Hub: out
 
-	async send(chatId: number, text: string, options: SendOptions = {}): Promise<number | undefined> {
+	async send(chatId: number, text: Localized, options: SendOptions = {}): Promise<number | undefined> {
 		if (!this.bot) throw new Error("telegram bridge is not running");
+		// Rendered per chat: the same notice can go out in Korean here and English there.
+		let body = render(text, this.lang(chatId));
 		// Exact known secrets (our own bot token above all) never ride along, whoever authored the text.
-		if (this.cfg.redactTranscript) text = redactSecrets(text);
-		text = scrubKnownSecrets(text);
+		if (this.cfg.redactTranscript) body = redactSecrets(body);
+		body = scrubKnownSecrets(body);
 		const markup = options.keyboard?.length ? { inline_keyboard: options.keyboard } : undefined;
 		const base = {
 			...(markup ? { reply_markup: markup } : {}),
@@ -1148,13 +1172,13 @@ export class TelegramBridge implements Hub {
 		};
 		let firstId: number | undefined;
 		if (options.markdown === false) {
-			for (const piece of splitHtmlChunks(text, 4000)) {
+			for (const piece of splitHtmlChunks(body, 4000)) {
 				const sent = await this.bot.sendSafe(chatId, piece, base);
 				firstId ??= sent?.message_id;
 			}
 			return firstId;
 		}
-		for (const chunk of toHtmlChunks(text)) {
+		for (const chunk of toHtmlChunks(body)) {
 			const sent = await this.bot.sendSafe(chatId, chunk, base);
 			firstId ??= sent?.message_id;
 		}
@@ -1162,11 +1186,11 @@ export class TelegramBridge implements Hub {
 	}
 
 	/** Send text that already contains Telegram HTML. */
-	async sendHtml(chatId: number, html: string, options: SendOptions = {}): Promise<void> {
+	async sendHtml(chatId: number, html: Localized, options: SendOptions = {}): Promise<void> {
 		await this.send(chatId, html, { ...options, markdown: false });
 	}
 
-	async broadcast(text: string, options: SendOptions = {}): Promise<void> {
+	async broadcast(text: Localized, options: SendOptions = {}): Promise<void> {
 		for (const chatId of this.chats()) {
 			try {
 				await this.send(chatId, text, options);
@@ -1666,6 +1690,31 @@ export class TelegramBridge implements Hub {
 
 	labelFor(chatId: number): string {
 		return this.cfg.chats.find((chat) => chat.chatId === chatId)?.label ?? this.chatTitles.get(chatId) ?? `chat ${chatId}`;
+	}
+
+	/**
+	 * What language this chat hears us in. Their own choice wins, then the configured default (which an
+	 * upgrade sets to Korean so nobody's phone changes under them), then what Telegram says their client
+	 * speaks. English is the fallback: it is the language the documentation is written in.
+	 */
+	lang(chatId: number): Lang {
+		const record = this.cfg.chats.find((chat) => chat.chatId === chatId);
+		return record?.lang ?? this.cfg.language ?? record?.tgLang ?? this.seenLang.get(chatId) ?? "en";
+	}
+
+	setLang(chatId: number, lang: Lang | undefined): void {
+		const record = this.cfg.chats.find((chat) => chat.chatId === chatId);
+		if (!record) return;
+		record.lang = lang;
+		this.save();
+	}
+
+	langSource(chatId: number): "chat" | "config" | "telegram" | "default" {
+		const record = this.cfg.chats.find((chat) => chat.chatId === chatId);
+		if (record?.lang) return "chat";
+		if (this.cfg.language) return "config";
+		if (record?.tgLang || this.seenLang.get(chatId)) return "telegram";
+		return "default";
 	}
 
 	pairThisChat(chatId: number): void {

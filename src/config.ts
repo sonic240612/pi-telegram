@@ -5,6 +5,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { Lang } from "./i18n.ts";
+import { isLang } from "./i18n.ts";
 
 /** 0 = answers only, 1 = answers + per-turn tool summary (default), 2 = full transcript mirror. */
 export type Verbosity = 0 | 1 | 2;
@@ -14,6 +16,10 @@ export interface TelegramChatRecord {
 	/** Human label captured when the chat was paired. */
 	label?: string;
 	addedAt: number;
+	/** What this chat chose with /tg lang. Beats every other setting for that chat. */
+	lang?: Lang;
+	/** What Telegram last told us the user's client speaks, remembered so a restart keeps it. */
+	tgLang?: Lang;
 }
 
 export interface TelegramConfig {
@@ -29,6 +35,11 @@ export interface TelegramConfig {
 	activityLive: boolean;
 	/** Last processed getUpdates offset (resumes without replaying). */
 	offset?: number;
+	/**
+	 * Language of everything the bridge itself says, for every chat that has not chosen its own. Left
+	 * unset, each chat follows the language Telegram reports for that user's client.
+	 */
+	language?: Lang;
 	/** Send a notice when the bridge connects/disconnects. */
 	announce: boolean;
 	/**
@@ -93,8 +104,17 @@ export function loadConfig(): TelegramConfig {
 	if (Array.isArray(value.chats)) {
 		cfg.chats = value.chats
 			.filter((c): c is TelegramChatRecord => !!c && typeof c.chatId === "number")
-			.map((c) => ({ chatId: c.chatId, label: typeof c.label === "string" ? c.label : undefined, addedAt: c.addedAt ?? Date.now() }));
+			.map((c) => ({
+				chatId: c.chatId,
+				label: typeof c.label === "string" ? c.label : undefined,
+				addedAt: c.addedAt ?? Date.now(),
+				lang: isLang((c as Partial<TelegramChatRecord>).lang) ? (c as Partial<TelegramChatRecord>).lang : undefined,
+				tgLang: isLang((c as Partial<TelegramChatRecord>).tgLang) ? (c as Partial<TelegramChatRecord>).tgLang : undefined,
+			}));
 	}
+	// An install that already works keeps speaking the language it always used. Auto-detection is only a
+	// default for chats paired from now on, so upgrading never changes the words on someone's phone.
+	cfg.language = inheritedLanguage(cfg.chats, value.language);
 	if (value.verbosity === 0 || value.verbosity === 1 || value.verbosity === 2) cfg.verbosity = value.verbosity;
 	if (typeof value.streaming === "boolean") cfg.streaming = value.streaming;
 	if (typeof value.activityLive === "boolean") cfg.activityLive = value.activityLive;
@@ -107,6 +127,15 @@ export function loadConfig(): TelegramConfig {
 		cfg.pendingNotice = { text: notice.text, at: notice.at };
 	}
 	return cfg;
+}
+
+/**
+ * The language an install starts with: what the config file says when it says anything, otherwise Korean
+ * for an install that already has chats — those people have never seen English from this bridge —
+ * otherwise nothing, which means "ask telegram what each chat's client speaks".
+ */
+export function inheritedLanguage(chats: unknown[], written: unknown): Lang | undefined {
+	return isLang(written) ? written : chats.length > 0 ? "ko" : undefined;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;

@@ -5,6 +5,7 @@
 import type { ContextUsage, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TelegramConfig } from "./config.ts";
 import type { GoalSnapshot, FocusState } from "./goal.ts";
+import type { Lang, Localized } from "./i18n.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface SendOptions {
@@ -128,8 +129,18 @@ export interface Hub {
 	chats(): number[];
 	labelFor(chatId: number): string;
 	/** Send a message; resolves to the telegram message id when one exists (needed to edit it later). */
-	send(chatId: number, text: string, options?: SendOptions): Promise<number | undefined>;
-	broadcast(text: string, options?: SendOptions): Promise<void>;
+	send(chatId: number, text: Localized, options?: SendOptions): Promise<number | undefined>;
+	broadcast(text: Localized, options?: SendOptions): Promise<void>;
+	/**
+	 * The language this chat hears the bridge in: what that chat chose, else the configured default,
+	 * else the language Telegram reports for that user's client. Text the bridge builds ahead of time
+	 * (keyboard labels, draft headers) has to ask; text handed to send/broadcast is rendered for it.
+	 */
+	lang(chatId: number): Lang;
+	/** Pin one chat's language; `undefined` hands it back to automatic detection. */
+	setLang(chatId: number, lang: Lang | undefined): void;
+	/** Why that language: the chat's own choice, the config file, telegram's client language, or the fallback. */
+	langSource(chatId: number): "chat" | "config" | "telegram" | "default";
 	sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: string): Promise<void>;
 	broadcastFile(data: Uint8Array, fileName: string, caption?: string): Promise<void>;
 	editKeyboard(chatId: number, messageId: number, text: string, rows: TgInlineKeyboardButton[][]): Promise<boolean>;

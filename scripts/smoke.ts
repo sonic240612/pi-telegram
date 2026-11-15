@@ -19,6 +19,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftHtml, mdToHtml, toHtmlChunks } from "../src/format.ts";
 import { TelegramBot } from "../src/telegram.ts";
+import { langFromTelegramCode } from "../src/i18n.ts";
+import { inheritedLanguage } from "../src/config.ts";
 
 // ── isolated pi dir + workspace before any project import ──────────────────────────
 const agentDir = mkdtempSync(join(tmpdir(), "pi-tg-agent-"));
@@ -222,7 +224,7 @@ function pushMessage(chatId: number, text: string, extra: Record<string, unknown
 		update_id: ++updateId,
 		message: {
 			message_id: ++messageId,
-			from: { id: 900, first_name: "Tester" },
+			from: { id: 900, first_name: "Tester", language_code: "ko" },
 			chat: { id: chatId, type: "private", first_name: "Tester" },
 			date: Math.floor(Date.now() / 1000),
 			text,
@@ -236,7 +238,7 @@ function pushEdited(chatId: number, text: string): void {
 		update_id: ++updateId,
 		edited_message: {
 			message_id: ++messageId,
-			from: { id: 900, first_name: "Tester" },
+			from: { id: 900, first_name: "Tester", language_code: "ko" },
 			chat: { id: chatId, type: "private", first_name: "Tester" },
 			date: Math.floor(Date.now() / 1000),
 			text,
@@ -244,12 +246,12 @@ function pushEdited(chatId: number, text: string): void {
 	});
 }
 
-function pushCallback(chatId: number, message: number, data: string): void {
+function pushCallback(chatId: number, message: number, data: string, languageCode = "ko"): void {
 	updateQueue.push({
 		update_id: ++updateId,
 		callback_query: {
 			id: `cb${++callbackSeq}`,
-			from: { id: 900, first_name: "Tester" },
+			from: { id: 900, first_name: "Tester", language_code: languageCode },
 			message: { message_id: message, chat: { id: chatId, type: "private", first_name: "Tester" }, date: Math.floor(Date.now() / 1000) },
 			data,
 		},
@@ -1052,6 +1054,39 @@ pushMessage(CHAT, "/tg pending");
 await waitFor("pending listing", () => textMessages("pending").length > 0);
 check("/tg pending reachable from Telegram", true);
 
+// 15b. the bridge speaks the language of the chat it is answering. Telegram names the language of the
+// user's client on every update; a chat can pin its own, and what was detected is remembered.
+const EN_CHAT = 555000999;
+commandHandlers.get("telegram")?.(`add ${EN_CHAT}`, ctx);
+await waitFor("english chat paired", () => readFileSync(configPath, "utf8").includes(String(EN_CHAT)), 8000);
+pushMessage(EN_CHAT, "/tg lang", { from: { id: 901, first_name: "Tester", language_code: "en-US" } });
+await waitFor("the english chat hears english", () => textMessages("Language for this chat").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
+const enLang = String(textMessages("Language for this chat").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
+check("the client language telegram reports decides how the bridge talks", /detected from the language telegram reports/i.test(enLang), shapeText(enLang));
+check("an english-speaking chat never hears the bridge in korean", !/\p{Script=Hangul}/u.test(enLang), enLang.slice(0, 140));
+await waitFor("the detected language reaches the config", () => readFileSync(configPath, "utf8").includes('"tgLang": "en"'), 8000);
+check("what telegram told us survives a restart", readFileSync(configPath, "utf8").includes('"tgLang": "en"'));
+pushMessage(EN_CHAT, "/tg lang ko");
+await waitFor("that chat can pick korean for itself", () => textMessages("이 채팅은 이제 한국어").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
+pushMessage(EN_CHAT, "/tg lang en");
+await waitFor("a pin reaches the config", () => readFileSync(configPath, "utf8").includes('"lang": "en"'), 8000);
+check("a chat can pin its own language", readFileSync(configPath, "utf8").includes('"lang": "en"'));
+pushMessage(EN_CHAT, "/tg lang auto");
+await waitFor("the pin comes back off", () => !readFileSync(configPath, "utf8").includes('"lang": "en"'), 8000);
+check("and hand it back to detection", !readFileSync(configPath, "utf8").includes('"lang": "en"'));
+check(
+	"telegram's language codes are mapped honestly",
+	langFromTelegramCode("ko") === "ko" && langFromTelegramCode("en-GB") === "en" && langFromTelegramCode("ja") === "en" && langFromTelegramCode(undefined) === undefined,
+);
+pushMessage(CHAT, "/chats");
+await waitFor("chat list shows the english chat", () => textMessages("paired chats").some((call) => String(call.params.text).includes(String(EN_CHAT))), 12_000);
+const revokeEn = lastKeyboard("paired chats")
+	.flat()
+	.find((button) => button.text.includes(String(EN_CHAT)));
+check("the chat list offers to revoke that chat", revokeEn !== undefined, JSON.stringify(lastKeyboard("paired chats")).slice(0, 200));
+pushCallback(CHAT, Number(textMessages("paired chats").at(-1)?.params.message_id ?? 0), revokeEn!.callback_data);
+await waitFor("english chat unpaired", () => !readFileSync(configPath, "utf8").includes(String(EN_CHAT)), 8000);
+
 // 16. edited messages, empty messages
 pushEdited(CHAT, "i edited my message");
 await waitFor("edited notice", () => textMessages("편집된 메시지").length > 0);
@@ -1772,6 +1807,13 @@ check("config persists chats, verbosity and update offset", saved.offset !== und
 check("the config write leaves no temp copy of the token behind", !existsSync(`${configPath}.tmp`));
 const leakedTokens = tokenSamples.filter((token) => token && readFileSync(configPath, "utf8").includes(token));
 check("no keyboard tokens leak into config", leakedTokens.length === 0, `${tokenSamples.length} sampled, leaked: ${leakedTokens.slice(0, 2).join(",")}`);
+
+// 24. an install that already had chats keeps the words it was already using, so shipping a
+// language feature does not change what a person's phone answers them with.
+check(
+	"an install that already has chats keeps speaking korean",
+	inheritedLanguage([{ chatId: 1 }], undefined) === "ko" && inheritedLanguage([], undefined) === undefined && inheritedLanguage([{ chatId: 1 }], "en") === "en",
+);
 
 check("nothing the bridge does leaves an unhandled rejection", unhandled.length === 0, JSON.stringify(unhandled.slice(0, 3)));
 server.close();

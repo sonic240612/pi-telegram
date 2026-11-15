@@ -13,6 +13,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Hub } from "./hub.ts";
+import type { Localized } from "./i18n.ts";
 import type { DraftManager } from "./draft.ts";
 import {
 	draftHtml,
@@ -438,7 +439,7 @@ export class OutboundMirror {
 
 	// ---- sending ----
 
-	private async sendHtml(chatId: number, html: string): Promise<void> {
+	private async sendHtml(chatId: number, html: Localized): Promise<void> {
 		try {
 			await this.hub.send(chatId, html, { markdown: false });
 		} catch {
@@ -446,7 +447,7 @@ export class OutboundMirror {
 		}
 	}
 
-	private async sendHtmlAll(html: string): Promise<void> {
+	private async sendHtmlAll(html: Localized): Promise<void> {
 		for (const chatId of this.chats()) await this.sendHtml(chatId, html);
 	}
 }
