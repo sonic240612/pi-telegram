@@ -137,6 +137,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tg restart` | — | Reconnect. |
 | `/tg verbose [0\|1\|2]` · `/tg stream [on\|off]` | | Same as the top-level commands. |
 | `/tg activity [on\|off]` | | At detail `1`, either keep one tool board live during the turn (default) or show only the summary when the turn ends. |
+| `/tg bridge` | — | The pi windows that share this bot token, which one is connected, and which one is allowed to poll. `/tg bridge off` disconnects this window (the same as `/telegram off`). |
 | `/tg lang [ko\|en\|auto]` | | What language the bridge uses in this chat, why it chose that one, and how to change it. `auto` hands it back to what Telegram reports. |
 | `/tg stats` (alias `/tg latency`) | — | Telegram call count / average / max, poll count, slow calls, 429s, and prompt → run-start delay. Tells you whether a slow reply is pi thinking or the network. |
 | `/tg menu` | — | Re-register the “/” autocomplete menu and verify what Telegram serves. Use it when the autocomplete list looks wrong (see below). |
@@ -188,6 +189,8 @@ the bridge:
 | Command | What it does |
 | --- | --- |
 | `/telegram status\|start\|restart\|stop` | bridge lifecycle |
+| `/telegram on` · `/telegram off` | take the bridge over from another pi window · let it go, and stay off until you say `on` |
+| `/telegram who` | every pi window holding this token, and which one polls Telegram |
 | `/telegram token <token>` | store the bot token |
 | `/telegram pair [code]` · `/telegram add <chat_id>` | approve a waiting chat |
 | `/telegram chats` | paired chats |
@@ -258,6 +261,10 @@ want the tool available at all — remove it from pi's tool list if you do not.
 | `redactTranscript` | also scrub the mirrored transcript (default `false` — detail mode should match the terminal) |
 | `offset` | last processed Telegram `update_id` (survives restarts, so nothing is replayed) |
 
+Next to it sits `telegram-lease.json` — coordination, not configuration: which pi window is allowed to
+poll this token, and which windows are merely open. It holds no secrets, and deleting it is harmless
+(the next session just claims the bridge).
+
 Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by the offline tests),
 `PI_TG_DEBUG=1` (diagnostics on stderr only, never into the chat).
 
@@ -271,6 +278,16 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   week — and a fresh install follows Telegram. What pi *answers* is never rewritten: the language of
   your prompt and the model decide that, and `/model` can carry an instruction like "answer in Korean"
   (`/resume` brings that back with the session).
+* **One bot token, and only one window polling it.** Open a second pi with the same token and both would
+  poll, so Telegram answers with `409 conflict` and the phone's messages land in whichever window grabs
+  the update first. The bridge settles that before it starts: the first session to arrive takes the
+  bridge, later ones open *disconnected* and say so instead of fighting — `/telegram who` (or `/tg bridge`)
+  lists every window and which one holds it, and each heartbeat is stamped, so when a window is closed or
+  crashes the next one takes over on its own within a few seconds. `/telegram on` (or `/telegram start`,
+  `/telegram restart`) takes the bridge over from a window that is still alive; `/telegram off` lets it go
+  and stays off until you say `on`. A pi that replaces its own session (`/new`, `/resume`, `/fork`,
+  `/reload`) keeps the bridge it already had, and the half-finished bridge it leaves behind cannot hand it
+  to somebody else.
 * **Compaction is visible.** pi blocks new prompts while it rebuilds its context, and it used to do
   that silently as far as Telegram was concerned. Now the bridge announces it — `🗜 컨텍스트 압축 중…`
   with the context size and what triggered it (`/compact`, the context threshold, or an overflow

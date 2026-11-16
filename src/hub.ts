@@ -221,6 +221,10 @@ export interface Hub {
 
 	verbosity(): 0 | 1 | 2;
 	setWorkingNotice(text: string | undefined): void;
+	/** Every pi window with the bridge loaded, and which one is allowed to poll telegram. */
+	bridgeSessions(): { label: string; pid: number; connected: boolean; holding: boolean; here: boolean }[];
+	/** Turn this pi session's connection off; another open window may take the bridge over. */
+	bridgeTurnOff(): Promise<void>;
 	/** Transient "입력 중…" hint for one chat; fire and forget. */
 	typing(chatId: number): void;
 	/**

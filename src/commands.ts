@@ -195,7 +195,7 @@ export class CommandLayer {
 			[L("모델·도구", "models & tools"), "/model [name|search] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<name>]"],
 			[L("실행", "running a turn"), "/abort · /steer <message> · /queue <message> · /bash <shell command>"],
 			[L("상태·표시", "status & display"), "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			[L("브리지", "the bridge itself"), "/pair · /chats · /pending · /unpair <chat id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal"],
+			[L("브리지", "the bridge itself"), "/pair · /chats · /pending · /unpair <chat id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal|bridge"],
 		];
 		const body = (lang: Lang) => sections.map(([title, list]) => `<b>${escapeHtml(render(title, lang))}</b>\n${list}`).join("\n\n");
 		const notes: Localized[] = [
@@ -258,6 +258,14 @@ ${joinLines(notes)(lang)}`,
 		// user most needs to see while pi runs unattended.
 		if (goal) {
 			parts.push(`goal ${goalStatusLabel(goal.status)} ${inlineCode(truncate(goal.id, 24))}${goal.tasksTotal ? ` · ${goal.tasksDone}/${goal.tasksTotal}` : ""} · ${formatCount(goal.tokensUsed)} tok <i>(/tg goal)</i>`);
+		}
+		// More than one pi window can answer this bot; the phone should know which one it is talking to.
+		const windows = this.hub.bridgeSessions();
+		if (windows.length > 1) {
+			parts.push(
+				(lang) =>
+					`${pick(lang, "pi 세션", "pi sessions")}: ${windows.length} · ${pick(lang, "이 창", "this window")} ${inlineCode(windows.find((w) => w.here)?.label ?? "?")} ${windows.find((w) => w.here)?.connected ? pick(lang, "연결됨", "connected") : pick(lang, "기다리는 중", "waiting")} · ${inlineCode("/tg bridge")}`,
+			);
 		}
 		await this.say(chatId, joinLines(parts));
 	}
@@ -663,13 +671,41 @@ ${joinLines(notes)(lang)}`,
 				return this.tgStats(chatId);
 			case "menu":
 				return this.tgMenu(chatId);
+			case "bridge": {
+				// Which pi window owns the connection — the answer to "why is my other window silent?"
+				const sessions = this.hub.bridgeSessions();
+				if (rest[0] === "off") {
+					await this.hub.bridgeTurnOff();
+					return this.say(
+						chatId,
+						(lang) =>
+							`🔌 ${pick(
+								lang,
+								`이 pi 세션의 텔레그램 연결을 껐어요 — 이 채팅은 이제 이 세션에 닿지 않아요. 다른 pi 세션이 이어받을 수 있고, 어느 창에서든 ${inlineCode("/telegram on")} 로 다시 켤 수 있어요.`,
+								`disconnected this pi session from telegram — this chat no longer reaches it. Another open pi session can take over, and ${inlineCode("/telegram on")} in any window's terminal turns it back on.`,
+							)}`,
+					);
+				}
+				return this.say(
+					chatId,
+					(lang) =>
+						[
+							`🔌 <b>${pick(lang, "pi 세션과 연결", "pi sessions and the connection")}</b>`,
+							...sessions.map(
+								(session) =>
+									`${session.here ? "▸" : "·"} ${escapeHtml(session.label)} <i>pid ${session.pid}</i> — ${session.connected ? pick(lang, "연결됨", "connected") : pick(lang, "기다리는 중", "waiting")}`,
+							),
+							`<i>${pick(lang, "이 봇을 읽는 세션은 한 번에 하나만 — 다른 창으로 옮기려면 그 pi 터미널에서 /telegram on", "only one session reads this bot at a time — /telegram on in another window's terminal moves it there")}</i>`,
+						].join(String.fromCharCode(10)),
+				);
+			}
 			case "goal": {
 				// pi-goal-x owns /goal; the phone-side view of the same state lives here.
 				const state = this.hub.goalState();
 				return this.say(chatId, goalCardHtml(state.goal, state.focus));
 			}
 			default:
-				return this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal")}`);
+				return this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal|bridge")}`);
 		}
 	}
 

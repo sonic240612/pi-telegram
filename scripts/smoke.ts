@@ -14,13 +14,14 @@
  * config persistence and file permissions.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, existsSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftHtml, mdToHtml, toHtmlChunks } from "../src/format.ts";
 import { TelegramBot } from "../src/telegram.ts";
 import { langFromTelegramCode } from "../src/i18n.ts";
 import { inheritedLanguage } from "../src/config.ts";
+import { claim, readState, release, shouldTakeOver, type BridgeOwner } from "../src/lease.ts";
 
 // ── isolated pi dir + workspace before any project import ──────────────────────────
 const agentDir = mkdtempSync(join(tmpdir(), "pi-tg-agent-"));
@@ -1969,7 +1970,121 @@ const tokenSamples = calls
 	.map((button) => (button.callback_data ?? "").slice(2))
 	.filter((value) => value.length >= 8);
 
-// 22. shutdown persists config
+// 23. two pi windows, one bot token: who polls, and what happens when they disagree.
+const leasePath = join(agentDir, "telegram-lease.json");
+const flat = (path: string) => readFileSync(path, "utf8").replace(/\s+/g, " ").slice(0, 200);
+check("a connected bridge writes down that it owns the bridge", existsSync(leasePath) && readFileSync(leasePath, "utf8").includes(String(process.pid)), existsSync(leasePath) ? flat(leasePath) : "no lease file");
+const foreignLease = (alive: boolean) => {
+	const at = alive ? Date.now() : Date.now() - 120_000;
+	return JSON.stringify({
+		bridge: { owner: "pi-4242", pid: 4242, host: "another-machine", cwd: "C:/other", label: "laptop window", since: at, heartbeat: at },
+		sessions: [{ owner: "pi-4242", pid: 4242, host: "another-machine", cwd: "C:/other", label: "laptop window", since: at, heartbeat: at, connected: true, holding: true }],
+		released: undefined,
+	});
+};
+commandHandlers.get("telegram")?.("who", ctx);
+const rosterNotice = notices.filter((n) => n.message.includes("telegram bridge:")).at(-1)?.message ?? "";
+check(
+	"the terminal can ask which pi window holds the bridge",
+	/this window \(.*\) holds it/i.test(rosterNotice) && /pi sessions with telegram loaded/i.test(rosterNotice),
+	rosterNotice.slice(0, 200),
+);
+
+// Another window forces itself in (its heartbeat is right now). This window has to notice on its own
+// and stand down, because two pollers on one token only trade 409s.
+	const updatesBeforeHandover = calls.filter((call) => call.method === "getUpdates").length;
+	const handoverNotices = notices.length;
+	writeFileSync(leasePath, foreignLease(true));
+	const handoverSeen = await settle(
+		"a window that loses the bridge to another window notices it",
+		() => notices.slice(handoverNotices).some((n) => /another pi session took|다른 pi 세션이 브리지를/i.test(n.message)),
+		25_000,
+	);
+	await sleep(1200);
+	const quietWindow = calls.filter((call) => call.method === "getUpdates").length;
+	await sleep(1500);
+	const updatesAfterHandover = calls.filter((call) => call.method === "getUpdates").length;
+	check("and stops polling rather than fighting over the token", handoverSeen && updatesAfterHandover === quietWindow, `${quietWindow} -> ${updatesAfterHandover} of ${updatesBeforeHandover} | ${notices.slice(handoverNotices).map((n) => n.message).join(" | ").slice(0, 150)}`);
+
+// An explicit `on` here means take it back, and the roster follows whoever is actually polling.
+const meCalls = calls.filter((call) => call.method === "getMe").length;
+commandHandlers.get("telegram")?.("on", ctx);
+await waitFor("an explicit on takes the bridge back", () => readFileSync(leasePath, "utf8").includes(String(process.pid)), 15_000);
+await waitFor("and reconnects", () => calls.filter((call) => call.method === "getMe").length > meCalls, 15_000);
+await sleep(300);
+commandHandlers.get("telegram")?.("who", ctx);
+check(
+	"the roster names the window holding it",
+	/this window \(.*\) holds it/i.test(notices.filter((n) => n.message.includes("telegram bridge:")).at(-1)?.message ?? ""),
+	notices.filter((n) => n.message.includes("telegram bridge:")).at(-1)?.message.slice(0, 160) ?? "",
+);
+check("and that window is connected", /connected as @/i.test(notices.map((n) => n.message).join("\n")), notices.slice(-4).map((n) => n.message).join(" | ").slice(0, 160));
+
+// Turning it off in this session releases the lease, and says a human asked for it: waiting windows
+// leave it alone for a while rather than snatching the phone back.
+	const stoppedBefore = textMessages("bridge stopped").length;
+commandHandlers.get("telegram")?.("off", ctx);
+await waitFor("off hands the lease back", () => readFileSync(leasePath, "utf8").includes('"released"'), 12_000);
+const offLease = readFileSync(leasePath, "utf8");
+check("and marks that a person asked for it, not a crash", offLease.includes('"shutdown": false') && offLease.includes(String(process.pid)), flat(leasePath));
+	await waitFor("and the chat sees the bridge go quiet", () => textMessages("bridge stopped").length > stoppedBefore, 12_000);
+	const rosterBefore = notices.length;
+	commandHandlers.get("telegram")?.("who", ctx);
+	const offRoster = await settle(
+		"the terminal roster answers after /telegram off",
+		() => notices.length > rosterBefore,
+		8_000,
+	);
+	check(
+		"the roster then says this window is off",
+		offRoster && /this window is off/i.test(notices.slice(rosterBefore).map((n) => n.message).join(" | ")),
+		notices.slice(rosterBefore).map((n) => n.message).join(" | ").slice(0, 200),
+);
+
+// The rules the bridge follows, checked on their own so a regression names the rule, not a symptom.
+const rulePath = join(agentDir, "telegram-lease-rules.json");
+const windowA: BridgeOwner = { owner: "pi-11@desk", token: "tok-a", pid: 11, host: "desk", cwd: "C:/a", label: "desk window", since: Date.now(), heartbeat: Date.now() };
+const windowB: BridgeOwner = { owner: "pi-22@laptop", token: "tok-b", pid: 22, host: "laptop", cwd: "C:/b", label: "laptop window", since: Date.now(), heartbeat: Date.now() };
+writeFileSync(rulePath, JSON.stringify({ bridge: windowB, sessions: [], released: undefined }));
+check("a window that is polling keeps the bridge", claim(rulePath, windowA).ok === false && readFileSync(rulePath, "utf8").includes("pi-22@laptop"), flat(rulePath));
+writeFileSync(rulePath, JSON.stringify({ bridge: { ...windowB, heartbeat: Date.now() - 120_000 }, sessions: [], released: undefined }));
+check("a window that died stops owning it", claim(rulePath, windowA).ok === true && readFileSync(rulePath, "utf8").includes("pi-11@desk"), flat(rulePath));
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: false } }));
+check("a window switched off by hand is not snatched back a moment later", shouldTakeOver(rulePath, windowB) === false);
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: false } }));
+// the window that typed `off` is on this machine and no longer running: nobody should stay locked out
+const deadPid = (() => {
+	for (let pid = process.pid + 1000; pid < process.pid + 6000; pid += 97) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return pid;
+		}
+	}
+	return 0;
+})();
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: `pi-${deadPid}@${hostname()}`, pid: deadPid, host: hostname(), at: Date.now(), shutdown: false } }));
+check("a window that switched off and then died stops holding anybody else back", shouldTakeOver(rulePath, windowB) === true, `dead pid ${deadPid}`);
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: false } }));
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: true } }));
+check("a window that closed hands the bridge over at once", shouldTakeOver(rulePath, windowB) === true);
+writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: undefined }));
+check("nobody holds it, so the first window that asks takes it", claim(rulePath, windowB).ok === true);
+release(rulePath, windowB, true);
+check("releasing clears the bridge line", readState(rulePath).bridge === null && readState(rulePath).released?.shutdown === true);
+const successor: BridgeOwner = { ...windowA, token: "tok-a2" };
+writeFileSync(rulePath, JSON.stringify({ bridge: { ...windowA, heartbeat: Date.now() }, sessions: [], released: undefined }));
+check("a window that reloads keeps the bridge it already had", claim(rulePath, successor).ok === true && readFileSync(rulePath, "utf8").includes("tok-a2"), flat(rulePath));
+release(rulePath, windowA, true);
+check("and the window it came from cannot unlock it", readState(rulePath).bridge?.token === "tok-a2", flat(rulePath));
+unlinkSync(rulePath);
+
+// A window opening while nobody polls opens connected; one opening while another holds it does not.
+commandHandlers.get("telegram")?.("on", ctx);
+await waitFor("back on for the sections that follow", () => readFileSync(leasePath, "utf8").includes(String(process.pid)), 15_000);
+
+
+// 24. shutdown persists config
 emit("session_shutdown", { reason: "quit" });
 await sleep(200);
 const saved = JSON.parse(readFileSync(configPath, "utf8")) as { offset?: number; chats: unknown[]; verbosity?: number };
@@ -1978,7 +2093,7 @@ check("the config write leaves no temp copy of the token behind", !existsSync(`$
 const leakedTokens = tokenSamples.filter((token) => token && readFileSync(configPath, "utf8").includes(token));
 check("no keyboard tokens leak into config", leakedTokens.length === 0, `${tokenSamples.length} sampled, leaked: ${leakedTokens.slice(0, 2).join(",")}`);
 
-// 24. an install that already had chats keeps the words it was already using, so shipping a
+// 25. an install that already had chats keeps the words it was already using, so shipping a
 // language feature does not change what a person's phone answers them with.
 check(
 	"an install that already has chats keeps speaking korean",

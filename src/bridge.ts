@@ -3,11 +3,13 @@
  * and implements the Hub interface that the mirror and command layers build on.
  */
 import { randomBytes, randomInt } from "node:crypto";
+import { hostname } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
+import { configPath, loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
+import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, shouldTakeOver, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
 import { GoalView, type FocusState, type GoalSnapshot } from "./goal.ts";
@@ -70,6 +72,8 @@ export class TelegramBridge implements Hub {
 	/** Session replacement (new / resume / fork / reload) re-creates the extension, so several
 	 *  bridges can exist in one process. Every debug line is tagged with the instance. */
 	static instances = 0;
+	/** The newest bridge alive in this process — the only one allowed to hold the lease. */
+	static newestInstance = 0;
 	readonly instanceId: number;
 
 	readonly cfg: TelegramConfig;
@@ -105,6 +109,26 @@ export class TelegramBridge implements Hub {
 	private seenLang = new Map<number, Lang>();
 
 	private disabled = false;
+	/**
+	 * One token, one poller, and pi does not know that. Sessions settle it in telegram-lease.json next
+	 * to the token: whoever holds it polls, the rest open quiet and say so. The owner is the process, so
+	 * a /reload or /new inside this window keeps the bridge instead of tripping over itself.
+	 */
+	private readonly leaseFile = join(dirname(configPath()), "telegram-lease.json");
+	private readonly me: BridgeOwner = {
+		owner: windowId(process.pid, hostname()),
+		token: randomBytes(6).toString("base64url"),
+		pid: process.pid,
+		host: hostname(),
+		cwd: process.cwd(),
+		label: "",
+		since: Date.now(),
+		heartbeat: Date.now(),
+	};
+	private leaseTimer: NodeJS.Timeout | undefined;
+	private holdsBridge = false;
+	private userTurnedOff = false;
+	private conflictWarnAt = 0;
 	/** In-flight teardown, so a session_start that races a shutdown reconnects instead of doing nothing. */
 	private stopping?: Promise<void>;
 	/** True once pi replaced this session; the bridge instance is a zombie and must not write notices. */
@@ -146,6 +170,7 @@ export class TelegramBridge implements Hub {
 
 	constructor(pi: ExtensionAPI) {
 		this.instanceId = ++TelegramBridge.instances;
+		TelegramBridge.newestInstance = this.instanceId;
 		this.pi = pi;
 		this.cfg = loadConfig();
 		this.drafts = new DraftManager(() => this.bot);
@@ -153,6 +178,15 @@ export class TelegramBridge implements Hub {
 		this.commands = new CommandLayer(this);
 		this.mirror = new OutboundMirror(this, this.drafts, this.activity);
 		this.questions = new QuestionnaireBridge(this);
+	}
+
+	/**
+	 * Connected for reporting purposes. A bridge that is mid-stop is already off as far as a
+	 * person is concerned — waiting out the in-flight long poll should not make /telegram off
+	 * look like it did nothing.
+	 */
+	private get connectedNow(): boolean {
+		return Boolean(this.bot) && !this.stopping;
 	}
 
 	/** Debug lines are tagged per bridge instance: replacement leaves more than one alive. */
@@ -302,13 +336,28 @@ export class TelegramBridge implements Hub {
 		this.pi.registerCommand("telegram", {
 			description: "Telegram bridge: status, start/stop, token, pairing",
 			getArgumentCompletions: (prefix) =>
-				["status", "start", "stop", "restart", "token", "pair", "add", "chats", "verbose"]
+				["on", "off", "who", "status", "start", "stop", "restart", "token", "pair", "add", "chats", "verbose"]
 					.map((value) => ({ value, label: `telegram ${value}` }))
 					.filter((item) => item.value.startsWith(prefix)),
 			handler: async (args, ctx) => {
 				this.eventCtx = ctx;
 				const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 				switch (sub) {
+					case "on":
+						if (rest[0]) this.setToken(rest[0]);
+						await this.takeOver();
+						return;
+					case "off":
+						await this.turnOff();
+						this.notifyUi(
+							ctx,
+							pick(this.defaultLang(), "telegram: 이 세션은 텔레그램과 연결을 끊었어요 — 다른 열린 세션이 이어받을 수 있어요", "telegram: this window disconnected — another open window may take the bridge over"),
+							"info",
+						);
+						return;
+					case "who":
+						this.notifyUi(ctx, this.rosterLine(), "info");
+						return;
 					case "status":
 						this.notifyUi(ctx, this.statusLine(), "info");
 						this.refreshStatus();
@@ -316,10 +365,10 @@ export class TelegramBridge implements Hub {
 					case "start":
 					case "restart":
 						if (rest[0]) this.setToken(rest[0]);
-						await this.start();
+						await this.takeOver();
 						return;
 					case "stop":
-						await this.stop("stopped from pi");
+						await this.turnOff();
 						return;
 					case "token":
 						if (!rest[0]) {
@@ -356,7 +405,7 @@ export class TelegramBridge implements Hub {
 						return;
 					}
 					default:
-						this.notifyUi(ctx, "usage: /telegram status|start|stop|restart|token|pair|add|chats|verbose", "info");
+						this.notifyUi(ctx, "usage: /telegram on|off|who · status|start|stop|restart|token|pair|add|chats|verbose", "info");
 				}
 			},
 		});
@@ -530,7 +579,13 @@ export class TelegramBridge implements Hub {
 		writeConfigNow(this.cfg);
 	}
 
-	async start(): Promise<{ ok: boolean; error?: string }> {
+	async start(opts: { force?: boolean } = {}): Promise<{ ok: boolean; error?: string }> {
+		// A person typed /telegram off in this window. Nothing short of them typing `on` puts it back —
+		// least of all a session event landing while the stop that turned it off is still unwinding.
+		if (this.userTurnedOff && !opts.force) {
+			this.notifyUi(this.eventCtx, "telegram bridge stays off in this session (/telegram on to take it back)", "info");
+			return { ok: false, error: "turned off in this session" };
+		}
 		const token = resolveToken(this.cfg);
 		if (!token) {
 			this.notifyUi(this.eventCtx, "telegram: no token. run /telegram-setup <bot-token> or set TELEGRAM_BOT_TOKEN.", "warning");
@@ -540,6 +595,39 @@ export class TelegramBridge implements Hub {
 		// it travels in every request path, so it must never appear in a message we did not author.
 		registerSecret(token);
 		await this.stop(undefined, true);
+
+		// Claiming comes after the old connection is gone — stopping hands the lease back, so claiming first would release it again.
+		// Two pi windows, one bot token: only the session holding the lease may poll. `force` is what
+		// /telegram on means — take it off the other window, which finds out and stands down.
+		this.userTurnedOff = false;
+		this.me.label = this.sessionLabel();
+		const got = claim(this.leaseFile, this.me, opts.force);
+		if (!got.ok) {
+			this.startLeaseTick(); // waiting: take over if that window dies, and stay on the roster
+			this.notifyUi(
+				this.eventCtx,
+				pick(
+					this.defaultLang(),
+					`telegram: 이 브리지는 다른 pi 세션이 사용 중이에요 — ${got.holder ? describeOwner(got.holder) : "another session"} · 이 창에서 쓰려면 /telegram on`,
+					`telegram: another pi session holds this bridge — ${got.holder ? describeOwner(got.holder) : "another session"} · /telegram on takes it in this window`,
+				),
+				"warning",
+			);
+			return { ok: false, error: `held by ${got.holder ? describeOwner(got.holder) : "another pi session"}` };
+		}
+		this.holdsBridge = true;
+		this.startLeaseTick();
+		if (got.holder) {
+			this.notifyUi(
+				this.eventCtx,
+				pick(
+					this.defaultLang(),
+					`telegram: 다른 pi 세션이 브리지를 쓰고 있었어요 — 이 세션으로 가져왔어요 (${describeOwner(got.holder)})`,
+					`telegram: took this bridge from another pi session (${describeOwner(got.holder)})`,
+				),
+				"warning",
+			);
+		}
 		// A replacement session builds this instance while the previous one is still writing config;
 		// pick up whatever it persisted so no update is replayed and no notice is lost.
 		this.adoptPersistedState();
@@ -563,6 +651,7 @@ export class TelegramBridge implements Hub {
 			this.notifyUi(this.eventCtx, `telegram bridge connected as ${displayName(me)}`, "info");
 			return { ok: true };
 		} catch (error) {
+			this.giveBack();
 			this.notifyUi(this.eventCtx, `telegram start failed: ${errorMessage(error)}${error instanceof TelegramError && /unauthorized/i.test(error.message) ? " — check the token (/telegram token <new>)" : ""}`, "error");
 			return { ok: false, error: errorMessage(error) };
 		}
@@ -596,18 +685,24 @@ export class TelegramBridge implements Hub {
 	}
 
 	private async stopInner(reason?: string, silent = false): Promise<void> {
+		this.giveBack(!this.userTurnedOff);
+		// A stopped bridge stops lobbying for the bridge. Without this, an instance whose session
+		// was replaced would heartbeat, spot the free lease and reconnect itself over the live one.
+		this.stopLeaseTick();
 		this.dbg("stop", reason, "silent:", silent, "replaced:", this.replacedSession);
 		this.clearPromptWatch("bridge stopped");
 		this.clearTerminalDialog();
 		// A questionnaire belonged to this session; leave dead buttons in the chats and they invite taps.
 		this.questions.closeAll(L("pi 세션이 끝나면서 질문도 닫혔어요.", "the pi session ended, and the question closed with it."));
+		// Say it while the bot is still reachable: a stop otherwise waits out the in-flight long poll,
+		// and the phone keeps reading "connected" for up to 25 seconds after /telegram off.
+		const bot = this.bot;
+		if (bot && !silent && this.cfg.announce && reason) await this.broadcast(`🔴 bridge stopped · ${escapeHtml(reason)}`, { markdown: false }).catch(() => undefined);
 		this.pollAbort?.abort();
 		const loop = this.pollLoop;
 		this.pollLoop = undefined;
 		this.pollAbort = undefined;
 		if (loop) await loop.catch(() => undefined);
-		const bot = this.bot;
-		if (bot && !silent && this.cfg.announce && reason) await this.broadcast(`🔴 bridge stopped · ${escapeHtml(reason)}`, { markdown: false }).catch(() => undefined);
 		this.bot = undefined;
 		if (this.replacedSession) {
 			// Actions waiting on the disposed session can never land; let those handlers unwind and
@@ -680,7 +775,130 @@ export class TelegramBridge implements Hub {
 
 	private async autoStart(): Promise<void> {
 		if (this.disabled || !resolveToken(this.cfg)) return;
-		await this.start().catch((error) => this.notifyUi(this.eventCtx, `telegram start failed: ${errorMessage(error)}`, "error"));
+		// A session opening while another window already polls opens disconnected — that is what keeps the
+		// 409 warning from scrolling past in the second window. Open a session when nothing holds the
+		// bridge and this one takes it.
+		await this.start({ force: false }).catch((error) => this.notifyUi(this.eventCtx, `telegram start failed: ${errorMessage(error)}`, "error"));
+	}
+
+	private sessionLabel(): string {
+		return this.sessionName() || basename(process.cwd());
+	}
+
+	/** Heartbeat: keeps our line in the roster, notices a takeover, and takes over when it is free. */
+	private startLeaseTick(): void {
+		if (this.leaseTimer) return;
+		this.leaseTimer = setInterval(() => void this.leaseTick(), LEASE_HEARTBEAT_MS);
+		this.leaseTimer.unref?.();
+	}
+
+	private stopLeaseTick(): void {
+		if (this.leaseTimer) clearInterval(this.leaseTimer);
+		this.leaseTimer = undefined;
+	}
+
+	private async leaseTick(): Promise<void> {
+		if (this.stopping) return;
+		// A bridge whose session is gone has no business in the roster at all: leave, and let the lease
+		// expire with whoever is really still running.
+		if (this.instanceId < TelegramBridge.newestInstance) {
+			this.giveBack(true);
+			this.stopLeaseTick();
+			return;
+		}
+		this.me.label = this.sessionLabel();
+		if (this.bot) {
+			const state = beat(this.leaseFile, this.me, true);
+			if (state.mine) return;
+			// Another window took it. Polling against it only trades 409s, so disconnect and wait.
+			this.holdsBridge = false;
+			this.notifyUi(
+				this.eventCtx,
+				pick(
+					this.defaultLang(),
+					`telegram: 다른 pi 세션이 브리지를 가져갔어요 — 이 창은 연결을 끊어요 (${state.holder ? describeOwner(state.holder) : "?"}) · /telegram on 으로 되찾기`,
+					`telegram: another pi session took this bridge — disconnecting this window (${state.holder ? describeOwner(state.holder) : "?"}) · /telegram on takes it back`,
+				),
+				"warning",
+			);
+			await this.stop(undefined, true);
+			this.startLeaseTick();
+			return;
+		}
+		if (this.disabled || this.userTurnedOff || !resolveToken(this.cfg)) {
+			beat(this.leaseFile, this.me, false);
+			return;
+		}
+		const orphan = readState(this.leaseFile).bridge;
+		if (!shouldTakeOver(this.leaseFile, this.me)) {
+			beat(this.leaseFile, this.me, false);
+			return;
+		}
+		this.notifyUi(
+			this.eventCtx,
+			pick(
+				this.defaultLang(),
+				`telegram: 브리지를 쓰고 있던 pi 세션이 사라져서 이 세션이 이어받아요${orphan ? ` (${describeOwner(orphan)})` : ""}`,
+				`telegram: the session that held this bridge is gone, so this one takes over${orphan ? ` (${describeOwner(orphan)})` : ""}`,
+			),
+			"warning",
+		);
+		await this.start({ force: false }).catch(() => undefined);
+	}
+
+	/** Put the lease back, when we are the one holding it. */
+	private giveBack(shutdown = true): void {
+		if (!this.holdsBridge) return;
+		this.holdsBridge = false;
+		try {
+			release(this.leaseFile, this.me, shutdown && !this.userTurnedOff);
+		} catch (error) {
+			this.dbg("lease release failed", error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	/** Who is alive, and which of them owns the connection — the answer /telegram who asks for. */
+	bridgeRoster(): { holder: BridgeOwner | null; sessions: BridgeSession[]; mine: string } {
+		const state = readState(this.leaseFile);
+		const now = Date.now();
+		return {
+			holder: state.bridge && holderAlive(state.bridge) ? state.bridge : null,
+			sessions: state.sessions.filter((session) => now - session.heartbeat < LEASE_TTL_MS),
+			mine: this.me.owner,
+		};
+	}
+
+	/** Plain shape of the roster for a chat card. */
+	bridgeSessions(): { label: string; pid: number; connected: boolean; holding: boolean; here: boolean }[] {
+		const roster = this.bridgeRoster();
+		return roster.sessions.map((session) => ({
+			label: session.owner === this.me.owner ? this.sessionLabel() || session.label || "pi" : session.label || "pi",
+			pid: session.pid,
+			// Our own line is answered live, not from the last heartbeat: a person who just typed
+			// /telegram off should see "off" on their phone, not whatever was true 15 seconds ago.
+			connected: session.owner === this.me.owner ? this.connectedNow : session.connected,
+			holding: session.owner === this.me.owner ? this.holdsBridge : session.holding,
+			here: session.owner === this.me.owner,
+		}));
+	}
+
+	/** `/telegram off`: this window lets go, and stays off until it is asked to connect again. */
+	async turnOff(): Promise<void> {
+		this.userTurnedOff = true;
+		await this.stop("turned off in this session");
+		this.startLeaseTick(); // still alive, still on the roster, still able to take over later
+	}
+
+	/** `/telegram on`: take the bridge in this window, from whoever has it. */
+	bridgeTurnOff(): Promise<void> {
+		return this.turnOff();
+	}
+
+	async takeOver(): Promise<void> {
+		// Typing `on` is the way out of `off`; without this the window would never auto-reconnect again.
+		this.userTurnedOff = false;
+		this.stopLeaseTick();
+		await this.start({ force: true });
 	}
 
 	private async runPollLoop(signal: AbortSignal): Promise<void> {
@@ -705,7 +923,33 @@ export class TelegramBridge implements Hub {
 				if (signal.aborted) return;
 				failures += 1;
 				if (error instanceof TelegramError && error.code === 409) {
-					this.notifyUi(this.eventCtx, "telegram: 409 conflict — another poller or a webhook already uses this token.", "warning");
+					// Usually means another pi window started polling: hand the lease over instead of
+					// warning forever. If the lease says this window still owns it, the other poller is
+					// something outside pi, and one warning a minute is enough to notice it.
+					if (beat(this.leaseFile, this.me, true).mine) {
+						if (Date.now() - this.conflictWarnAt > 60_000) {
+							this.conflictWarnAt = Date.now();
+							this.notifyUi(
+								this.eventCtx,
+								pick(
+									this.defaultLang(),
+									"telegram: 409 충돌 — 같은 토큰을 쓰는 다른 프로그램(webhook 포함)이 이미 polling 중이에요. 다른 pi 세션이 아니라면 /telegram token 으로 토큰을 바꾸세요.",
+									"telegram: 409 conflict — something outside pi already polls this token (another poller or a webhook). If it is not another pi window, rotate it with /telegram token <new>.",
+								),
+								"warning",
+							);
+						}
+					} else {
+						this.holdsBridge = false;
+						this.notifyUi(
+							this.eventCtx,
+							pick(this.defaultLang(), "telegram: 다른 pi 세션이 이 브리지를 가져갔어요 — 이 창은 연결을 끊어요 · /telegram on 으로 되찾기", "telegram: another pi session took this bridge — disconnecting this window · /telegram on takes it back"),
+							"warning",
+						);
+						await this.stop(undefined, true);
+						this.startLeaseTick();
+						return;
+					}
 					await sleep(5000);
 					continue;
 				}
@@ -823,7 +1067,7 @@ export class TelegramBridge implements Hub {
 		if (match) {
 			const command = match[1].toLowerCase();
 			const args = (match[2] ?? "").trim();
-			this.dbg("command", `/${command}`, args.slice(0, 40));
+			this.dbg("command", `/${command}`, "chat:", chatId, "args:", args.slice(0, 40));
 			try {
 				await this.commands.handle({ chatId, userId: message.from?.id ?? chatId, command, args, raw: text });
 			} catch (error) {
@@ -1875,7 +2119,25 @@ export class TelegramBridge implements Hub {
 	}
 
 	private statusLine(): string {
-		return `telegram bridge: ${this.bot ? `connected as ${this.botName()}` : "stopped"} · chats ${this.cfg.chats.length} · detail ${this.cfg.verbosity} · drafts ${this.cfg.streaming ? "on" : "off"}${this.cfg.token ? " · token saved" : ""}`;
+		return `telegram bridge: ${this.connectedNow ? `connected as ${this.botName()}` : "stopped"} · chats ${this.cfg.chats.length} · detail ${this.cfg.verbosity} · drafts ${this.cfg.streaming ? "on" : "off"}${this.cfg.token ? " · token saved" : ""}`;
+	}
+
+	/** Every pi window with this extension loaded, and which one is allowed to poll. */
+	private rosterLine(): string {
+		const roster = this.bridgeRoster();
+		const here: BridgeSession = { ...this.me, label: this.sessionLabel() || this.me.label, connected: this.connectedNow, holding: this.holdsBridge, heartbeat: Date.now() };
+		const others = roster.sessions.filter((session) => session.owner !== this.me.owner);
+		const who = (session: BridgeSession) =>
+			`${session.owner === this.me.owner ? "▸ " : "  "}${session.label || "pi"} · pid ${session.pid} · ${session.connected ? "connected" : session.owner === this.me.owner ? "off here" : "waiting"} · ${Math.max(0, Math.round((Date.now() - session.heartbeat) / 1000))}s ago`;
+		const lines = [
+			this.connectedNow
+				? `telegram bridge: this window (${here.label}) holds it — /telegram off lets it go`
+				: `telegram bridge: this window is ${this.userTurnedOff ? "off" : "waiting"} — held by ${roster.holder ? describeOwner(roster.holder) : "nobody"}`,
+			`pi sessions with telegram loaded: ${roster.sessions.length}`,
+			who(here),
+			...others.map(who),
+		];
+		return lines.join(String.fromCharCode(10));
 	}
 
 	private refreshStatus(running?: string): void {
