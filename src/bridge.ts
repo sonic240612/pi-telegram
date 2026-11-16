@@ -334,7 +334,7 @@ export class TelegramBridge implements Hub {
 		});
 
 		this.pi.registerCommand("telegram", {
-			description: "Telegram bridge: status, start/stop, token, pairing",
+			description: "Telegram bridge: on/off/who, status, start/stop, token, pairing",
 			getArgumentCompletions: (prefix) =>
 				["on", "off", "who", "status", "start", "stop", "restart", "token", "pair", "add", "chats", "verbose"]
 					.map((value) => ({ value, label: `telegram ${value}` }))
@@ -363,12 +363,15 @@ export class TelegramBridge implements Hub {
 						this.refreshStatus();
 						return;
 					case "start":
+						if (rest[0]) this.setToken(rest[0]);
+						await this.connect();
+						return;
 					case "restart":
 						if (rest[0]) this.setToken(rest[0]);
-						await this.takeOver();
+						await this.restartBridge();
 						return;
 					case "stop":
-						await this.turnOff();
+						await this.disconnect();
 						return;
 					case "token":
 						if (!rest[0]) {
@@ -725,10 +728,6 @@ export class TelegramBridge implements Hub {
 		this.refreshStatus();
 	}
 
-	restartBridge(): void {
-		void this.start();
-	}
-
 	/**
 	 * Queue a chat notice for the bridge that will exist after a session replacement.
 	 * /new, /resume and /fork dispose this pi session and re-create the extension, so the instance
@@ -882,18 +881,46 @@ export class TelegramBridge implements Hub {
 		}));
 	}
 
-	/** `/telegram off`: this window lets go, and stays off until it is asked to connect again. */
+	/**
+	 * `/telegram off`: this window lets go and stays off until a person says otherwise. A session event
+	 * must not quietly undo that choice; `on` or `start` is the way back.
+	 */
 	async turnOff(): Promise<void> {
 		this.userTurnedOff = true;
 		await this.stop("turned off in this session");
 		this.startLeaseTick(); // still alive, still on the roster, still able to take over later
 	}
 
-	/** `/telegram on`: take the bridge in this window, from whoever has it. */
+	/** `/telegram stop`: pause the polling in this window without deciding anything for later. */
+	async disconnect(): Promise<void> {
+		this.userTurnedOff = false;
+		await this.stop("stopped in this session");
+		this.startLeaseTick(); // on the roster, and free to pick the bridge up again by itself
+	}
+
+	/** `/telegram start`: connect if the bridge is free. Never takes it off another live window. */
+	async connect(): Promise<void> {
+		// Typing `start` in this window is a person asking for the connection, so it ends an `off`.
+		this.userTurnedOff = false;
+		await this.start({ force: false });
+	}
+
+	/**
+	 * `/telegram restart`: reconnect this window in place when it already holds the bridge. Another
+	 * window holding it is not ours to restart, so we stand down and say who has it.
+	 */
+	async restartBridge(): Promise<{ ok: boolean; error?: string }> {
+		this.userTurnedOff = false;
+		this.stopLeaseTick();
+		return this.start({ force: readState(this.leaseFile).bridge?.token === this.me.token });
+	}
+
+	/** Phone-side equivalent of `/telegram off`. */
 	bridgeTurnOff(): Promise<void> {
 		return this.turnOff();
 	}
 
+	/** `/telegram on`: take the bridge in this window, from whoever has it. */
 	async takeOver(): Promise<void> {
 		// Typing `on` is the way out of `off`; without this the window would never auto-reconnect again.
 		this.userTurnedOff = false;

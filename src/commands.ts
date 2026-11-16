@@ -652,9 +652,15 @@ ${joinLines(notes)(lang)}`,
 				const pending = this.hub.pendingChats();
 				return this.say(chatId, (lang) => (pending.length ? `<b>pending</b>\n${pending.map((entry) => `${escapeHtml(entry.label)} → ${inlineCode(entry.code)}`).join(String.fromCharCode(10))}\n${pick(lang, "pi 터미널에서", "in the pi terminal")} ${inlineCode("/telegram-pair <code>")}` : pick(lang, "pending 채팅 없음.", "no chats waiting for pairing.")));
 			}
-			case "restart":
-				this.hub.restartBridge();
-				return this.say(chatId, L("🔁 브리지 재시작했어요.", "🔁 restarting the bridge."));
+			case "restart": {
+				const done = await this.hub.restartBridge();
+				if (done.ok) return this.say(chatId, L("🔁 이 pi 창이 브리지를 다시 연결했어요.", "🔁 this pi window reconnected the bridge."));
+				return this.say(
+					chatId,
+					(lang) =>
+						`🔁 ${pick(lang, "다시 연결하지 못했어요 —", "could not reconnect —")} ${escapeHtml(redactSecrets(done.error ?? ""))} · ${pick(lang, "목록은", "the roster is in")} ${inlineCode("/tg bridge")}`,
+				);
+			}
 			case "verbose":
 				return this.verbose(chatId, rest);
 			case "stream":

@@ -188,9 +188,13 @@ the bridge:
 
 | Command | What it does |
 | --- | --- |
-| `/telegram status\|start\|restart\|stop` | bridge lifecycle |
-| `/telegram on` · `/telegram off` | take the bridge over from another pi window · let it go, and stay off until you say `on` |
+| `/telegram on` | take the bridge over from another pi window, even one that is still alive; also the way back from `off` |
+| `/telegram off` | let it go, and stay off until a person says `on` or `start` |
 | `/telegram who` | every pi window holding this token, and which one polls Telegram |
+| `/telegram start` | connect if the bridge is free — never takes it off another live window |
+| `/telegram stop` | stop polling in this window: another window may take it, and this one picks it back up on its own later |
+| `/telegram restart` | reconnect this window in place; when another window holds the bridge it says so instead of stealing it |
+| `/telegram status` | bridge state: bot, chats, verbosity, drafts, token saved |
 | `/telegram token <token>` | store the bot token |
 | `/telegram pair [code]` · `/telegram add <chat_id>` | approve a waiting chat |
 | `/telegram chats` | paired chats |
@@ -283,9 +287,9 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   the update first. The bridge settles that before it starts: the first session to arrive takes the
   bridge, later ones open *disconnected* and say so instead of fighting — `/telegram who` (or `/tg bridge`)
   lists every window and which one holds it, and each heartbeat is stamped, so when a window is closed or
-  crashes the next one takes over on its own within a few seconds. `/telegram on` (or `/telegram start`,
-  `/telegram restart`) takes the bridge over from a window that is still alive; `/telegram off` lets it go
-  and stays off until you say `on`. A pi that replaces its own session (`/new`, `/resume`, `/fork`,
+  crashes the next one takes over on its own within a few seconds. `/telegram on` takes the bridge over
+  from a window that is still alive, while `/telegram start` and `/telegram restart` connect only when the
+  bridge is free (or already theirs); `/telegram off` lets it go and stays off until you say `on`. A pi that replaces its own session (`/new`, `/resume`, `/fork`,
   `/reload`) keeps the bridge it already had, and the half-finished bridge it leaves behind cannot hand it
   to somebody else.
 * **Compaction is visible.** pi blocks new prompts while it rebuilds its context, and it used to do

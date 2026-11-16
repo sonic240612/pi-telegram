@@ -2079,8 +2079,38 @@ release(rulePath, windowA, true);
 check("and the window it came from cannot unlock it", readState(rulePath).bridge?.token === "tok-a2", flat(rulePath));
 unlinkSync(rulePath);
 
-// A window opening while nobody polls opens connected; one opening while another holds it does not.
+// `stop` is a pause and `off` is a decision — they must not mean the same thing.
 commandHandlers.get("telegram")?.("on", ctx);
+await waitFor("the window takes itself back after off", () => readState(leasePath).bridge?.pid === process.pid, 15_000);
+const pausedNotices = textMessages("bridge stopped").length;
+commandHandlers.get("telegram")?.("stop", ctx);
+await waitFor("stop hands the lease back as an ordinary shutdown", () => readFileSync(leasePath, "utf8").includes('"shutdown": true'), 12_000);
+check("a plain stop does not claim a person switched it off", !readFileSync(leasePath, "utf8").includes('"shutdown": false'), flat(leasePath));
+await waitFor("and the chat sees the bridge stop", () => textMessages("bridge stopped").length > pausedNotices, 12_000);
+await emitAwait("session_start", { type: "session_start", reason: "new" });
+const woke = await settle("a stopped window reconnects itself when pi moves on", () => readState(leasePath).bridge?.pid === process.pid, 15_000);
+check("a stopped window picks the bridge back up by itself", woke, flat(leasePath));
+
+// The same session_start after `off` must leave it alone: switching off was a person's choice.
+commandHandlers.get("telegram")?.("off", ctx);
+await waitFor("off again, lease handed back", () => readState(leasePath).bridge === null, 12_000);
+await emitAwait("session_start", { type: "session_start", reason: "new" });
+await sleep(1200);
+check("a window a person switched off does not sneak back on its own", readState(leasePath).bridge === null, flat(leasePath));
+commandHandlers.get("telegram")?.("start", ctx);
+const askedBack = await settle("but `start` from a person brings it back", () => readState(leasePath).bridge?.pid === process.pid, 15_000);
+check("and `start` is that way back", askedBack, flat(leasePath));
+
+// `start` asks politely; `on` is the one allowed to take it from a live window.
+const otherWindow: BridgeOwner = { owner: "pi-33@otherhost", token: "tok-other", pid: 33, host: "otherhost-that-is-not-here", cwd: "C:/o", label: "the other laptop", since: Date.now(), heartbeat: Date.now() };
+writeFileSync(leasePath, JSON.stringify({ bridge: otherWindow, sessions: [otherWindow], released: undefined }));
+commandHandlers.get("telegram")?.("start", ctx);
+await sleep(1200);
+check("start leaves another window's live bridge alone", readState(leasePath).bridge?.token === "tok-other", flat(leasePath));
+commandHandlers.get("telegram")?.("on", ctx);
+const grabbed = await settle("`on` is the one that takes it over", () => readState(leasePath).bridge?.pid === process.pid, 15_000);
+check("`on` takes the bridge over from a window that is still alive", grabbed, flat(leasePath));
+
 await waitFor("back on for the sections that follow", () => readFileSync(leasePath, "utf8").includes(String(process.pid)), 15_000);
 
 

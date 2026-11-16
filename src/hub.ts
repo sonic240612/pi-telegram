@@ -217,7 +217,7 @@ export interface Hub {
 	unpairChat(chatId: number): boolean;
 	pendingChats(): { chatId: number; code: string; label: string }[];
 	pairedChats(): { chatId: number; label: string; addedAt: number }[];
-	restartBridge(): void;
+	restartBridge(): Promise<{ ok: boolean; error?: string }>;
 
 	verbosity(): 0 | 1 | 2;
 	setWorkingNotice(text: string | undefined): void;
