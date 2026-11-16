@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { configPath, loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
-import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
+import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, sameWindow, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
 import { GoalView, type FocusState, type GoalSnapshot } from "./goal.ts";
@@ -131,6 +131,8 @@ export class TelegramBridge implements Hub {
 	private conflictWarnAt = 0;
 	/** In-flight teardown, so a session_start that races a shutdown reconnects instead of doing nothing. */
 	private stopping?: Promise<void>;
+	/** True from the moment a stop begins until it is done: what the light and the roster report. */
+	private stoppingNow = false;
 	/** True once pi replaced this session; the bridge instance is a zombie and must not write notices. */
 	private replacedSession = false;
 	/** Last internal failure, shown by /status and reported to the chats once per message. */
@@ -186,7 +188,7 @@ export class TelegramBridge implements Hub {
 	 * look like it did nothing.
 	 */
 	private get connectedNow(): boolean {
-		return Boolean(this.bot) && !this.stopping;
+		return Boolean(this.bot) && !this.stoppingNow && !this.stopping;
 	}
 
 	/** Debug lines are tagged per bridge instance: replacement leaves more than one alive. */
@@ -639,6 +641,15 @@ export class TelegramBridge implements Hub {
 			const me = await bot.getMe();
 			this.connectedAt = Date.now();
 			await this.registerMenu(bot);
+			// A stop typed while we were still dialling has to win. Without this check the in-flight start
+			// finishes a second later, opens the poll loop, and the phone sees a bridge that was just
+			// switched off come back connected.
+			if (this.stopping || this.stoppingNow) {
+				this.dbg("start aborted: a stop landed while dialling");
+				this.giveBack(true);
+				this.stopLeaseTick();
+				return { ok: false, error: "stopped while connecting" };
+			}
 			this.bot = bot;
 			this.startedAt = Date.now();
 			this.pollAbort = new AbortController();
@@ -683,16 +694,21 @@ export class TelegramBridge implements Hub {
 		try {
 			await task;
 		} finally {
+			this.stoppingNow = false;
 			if (this.stopping === task) this.stopping = undefined;
 		}
 	}
 
 	private async stopInner(reason?: string, silent = false): Promise<void> {
+		this.stoppingNow = true;
 		this.giveBack(!this.userTurnedOff);
 		// A stopped bridge stops lobbying for the bridge. Without this, an instance whose session
 		// was replaced would heartbeat, spot the free lease and reconnect itself over the live one.
 		this.stopLeaseTick();
 		this.dbg("stop", reason, "silent:", silent, "replaced:", this.replacedSession);
+		// Put the light out first. The farewell broadcast and the in-flight long poll are both network
+		// waits, and a person who typed /telegram off must not keep seeing 🟢 while those unwind.
+		this.refreshStatus();
 		this.clearPromptWatch("bridge stopped");
 		this.clearTerminalDialog();
 		// A questionnaire belonged to this session; leave dead buttons in the chats and they invite taps.
@@ -705,8 +721,11 @@ export class TelegramBridge implements Hub {
 		const loop = this.pollLoop;
 		this.pollLoop = undefined;
 		this.pollAbort = undefined;
-		if (loop) await loop.catch(() => undefined);
+		// Drop the light now. The in-flight long poll can take 25 s to unwind, and a window that just lost
+		// the bridge (or was switched off) must look disconnected the moment the person acts on it.
 		this.bot = undefined;
+		this.refreshStatus();
+		if (loop) await loop.catch(() => undefined);
 		if (this.replacedSession) {
 			// Actions waiting on the disposed session can never land; let those handlers unwind and
 			// fail quietly instead of holding their chat queue for the full command timeout.
@@ -2176,7 +2195,20 @@ export class TelegramBridge implements Hub {
 	private refreshStatus(running?: string): void {
 		const ctx = this.tryPiContext();
 		if (!ctx) return;
-		ctx.ui.setStatus("telegram-bridge", this.bot ? `🟢 tg ${this.botName()} · ${this.cfg.chats.length} chats${running ? ` · ${running}` : ""}` : "🔴 tg stopped");
+		const lang = this.defaultLang();
+		if (this.connectedNow) {
+			ctx.ui.setStatus("telegram-bridge", `🟢 tg ${this.botName()} · ${this.cfg.chats.length} chats${running ? ` · ${running}` : ""}`);
+			return;
+		}
+		// "stopped" is not one state. A window a person switched off, and a window somebody else took the
+		// bot from, look the same apart from the reason — and the reason is what to type next.
+		const holder = readState(this.leaseFile).bridge;
+		const why = this.userTurnedOff
+			? pick(lang, "tg 꺼짐 (/telegram on)", "tg off (/telegram on)")
+			: holder && !sameWindow(holder, this.me)
+				? pick(lang, "tg 다른 pi 창 사용 중 (/telegram on)", "tg another pi window has it (/telegram on)")
+				: pick(lang, "tg 꺼짐", "tg stopped");
+		ctx.ui.setStatus("telegram-bridge", `🔴 ${why}`);
 	}
 
 	save(): void {

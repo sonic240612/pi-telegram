@@ -2021,6 +2021,12 @@ check(
 	flat(leasePath),
 );
 
+// The terminal light is what a person reads first: the window that lost the bot must look red,
+// and say why, without waiting for the long poll to unwind.
+const lightAfterLoss = String(statuses["telegram-bridge"] ?? "");
+check("and the terminal light in the window that lost it goes red", lightAfterLoss.startsWith("🔴"), lightAfterLoss.slice(0, 80));
+check("and the light says another pi window has the bot", /다른 pi 창 사용 중|another pi window has it/i.test(lightAfterLoss), lightAfterLoss.slice(0, 80));
+
 // An explicit `on` here means take it back, and the roster follows whoever is actually polling.
 const meCalls = calls.filter((call) => call.method === "getMe").length;
 commandHandlers.get("telegram")?.("on", ctx);
@@ -2034,6 +2040,7 @@ check(
 	notices.filter((n) => n.message.includes("telegram bridge:")).at(-1)?.message.slice(0, 160) ?? "",
 );
 check("and that window is connected", /connected as @/i.test(notices.map((n) => n.message).join("\n")), notices.slice(-4).map((n) => n.message).join(" | ").slice(0, 160));
+check("and the terminal light turns green in the window holding it", String(statuses["telegram-bridge"] ?? "").startsWith("🟢"), String(statuses["telegram-bridge"]));
 
 // A short-lived pi (an updater, an agent window) can claim the lease and quit. The window a person
 // is using takes itself back rather than disconnecting over a session that no longer exists.
@@ -2068,6 +2075,7 @@ check("and marks that a person asked for it, not a crash", offLease.includes('"s
 		offRoster && /this window is off/i.test(notices.slice(rosterBefore).map((n) => n.message).join(" | ")),
 		notices.slice(rosterBefore).map((n) => n.message).join(" | ").slice(0, 200),
 );
+check("and the light says this window was switched off, not just quiet", /\/telegram on/.test(String(statuses["telegram-bridge"] ?? "")) && String(statuses["telegram-bridge"]).startsWith("🔴"), String(statuses["telegram-bridge"]));
 
 // The rules the bridge follows, checked on their own so a regression names the rule, not a symptom.
 const rulePath = join(agentDir, "telegram-lease-rules.json");
@@ -2124,6 +2132,12 @@ unlinkSync(rulePath);
 // `stop` is a pause and `off` is a decision — they must not mean the same thing.
 commandHandlers.get("telegram")?.("on", ctx);
 await waitFor("the window takes itself back after off", () => readState(leasePath).bridge?.pid === process.pid, 15_000);
+const connectedNotices = textMessages("connected to pi").length + textMessages("pi 연결됨").length;
+await waitFor(
+	"and the phone sees this window connected before pausing it",
+	() => textMessages("connected to pi").length + textMessages("pi 연결됨").length > connectedNotices,
+	15_000,
+);
 const pausedNotices = textMessages("bridge stopped").length;
 commandHandlers.get("telegram")?.("stop", ctx);
 await waitFor("stop hands the lease back as an ordinary shutdown", () => readFileSync(leasePath, "utf8").includes('"shutdown": true'), 12_000);

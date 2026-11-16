@@ -16,7 +16,7 @@ import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
 
 /** A live session renews its lease this often. */
-export const LEASE_HEARTBEAT_MS = 10_000;
+export const LEASE_HEARTBEAT_MS = 5_000;
 /**
  * Silence this long means the window is gone. Generous on purpose: a window that is merely busy, or a
  * laptop that was closed for a minute, must not lose the bridge the person is actually using.

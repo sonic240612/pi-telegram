@@ -297,6 +297,10 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
 * **Every pi on the machine loads this extension — including a headless coding-agent window.** Those
   count as windows in the roster and will take a free bridge. Turn the ones you do not want answering
   with `/telegram off` in that window, or start them with `pi --telegram-off`.
+* **The pi terminal shows who has the bot.** A small status line: `🟢 tg @bot · 2 chats` in the window
+  holding it, `🔴 tg off (/telegram on)` in one a person switched off, `🔴 tg another pi window has it
+  (/telegram on)` in one that was displaced. It flips a couple of seconds after the command rather than
+  waiting for the long poll to unwind, so two windows on one token are tellable at a glance.
 * **Compaction is visible.** pi blocks new prompts while it rebuilds its context, and it used to do
   that silently as far as Telegram was concerned. Now the bridge announces it — `🗜 컨텍스트 압축 중…`
   with the context size and what triggered it (`/compact`, the context threshold, or an overflow
