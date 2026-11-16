@@ -11,6 +11,8 @@
  * layout is not our contract, and a rename there must not break a bridge here.
  */
 import { escapeHtml, formatCount, formatDuration, inlineCode, truncate } from "./format.ts";
+import { pick } from "./i18n.ts";
+import type { Lang, Localized } from "./i18n.ts";
 
 /** pi-goal-x's focus entry (`pi.appendEntry("pi-goal-focus", …)`); read-only for us. */
 export const GOAL_FOCUS_ENTRY = "pi-goal-focus";
@@ -67,7 +69,7 @@ export class GoalView {
 	 * Fold a tool result in. Returns chat HTML when the change is worth telling the phone about —
 	 * a new goal, a status change, or visible task progress. Nothing else is announced.
 	 */
-	observeToolResult(result: unknown): string | undefined {
+	observeToolResult(result: unknown): Localized | undefined {
 		const goal = findGoal(result);
 		if (!goal) return undefined;
 		return this.announce(goal);
@@ -104,23 +106,23 @@ export class GoalView {
 		return this.snapshot;
 	}
 
-	private announce(goal: GoalSnapshot): string | undefined {
+	private announce(goal: GoalSnapshot): Localized | undefined {
 		const previous = this.snapshot;
 		this.snapshot = goal;
 		const key = announceKey(goal);
 		if (key === this.reportedKey) return undefined;
 		this.reportedKey = key;
-		const news = !previous
-			? "시작"
+		const news: GoalNews | undefined = !previous
+			? "start"
 			: previous.id !== goal.id
-				? "새 목표"
+				? "new"
 				: previous.status !== goal.status
-					? "상태 변경"
+					? "status"
 					: previous.tasksDone !== goal.tasksDone
-						? "진행"
+						? "progress"
 						: undefined;
 		if (!news) return undefined; // bookkeeping-only mutation: the phone does not need it
-		if (news === "진행" && Date.now() - this.lastAnnouncedAt < 20_000) return undefined;
+		if (news === "progress" && Date.now() - this.lastAnnouncedAt < 20_000) return undefined;
 		this.lastAnnouncedAt = Date.now();
 		return goalLineHtml(goal, news);
 	}
@@ -137,57 +139,92 @@ const STATUS_ICON: Record<string, string> = {
 	complete: "✅",
 };
 
+/** What changed about a goal. The word is chosen per chat, the fact is not up for debate. */
+type GoalNews = "start" | "new" | "status" | "progress";
+
+function goalNewsLabel(lang: Lang, news: GoalNews): string {
+	return pick(lang, { start: "시작", new: "새 목표", status: "상태 변경", progress: "진행" }[news], { start: "started", new: "new goal", status: "status changed", progress: "progress" }[news]);
+}
+
 export function goalStatusLabel(status: string): string {
 	return `${STATUS_ICON[status] ?? "🎯"} ${escapeHtml(status)}`;
 }
 
 /** One compact line for the mirror. */
-export function goalLineHtml(goal: GoalSnapshot, news: string): string {
-	const usage = [`${formatCount(goal.tokensUsed)} tok`, goal.tokenBudget ? `/ ${formatCount(goal.tokenBudget)}` : undefined, goal.activeSeconds ? formatDuration(goal.activeSeconds * 1000) : undefined]
-		.filter(Boolean)
-		.join(" ");
-	const parts = [`🎯 <b>goal</b> <i>(${news})</i> ${goalStatusLabel(goal.status)}${goal.autoContinue ? " <i>· 자동 계속</i>" : ""}`];
-	if (goal.tasksTotal) parts.push(`작업 ${goal.tasksDone}/${goal.tasksTotal}`);
-	if (goal.pauseReason) parts.push(`⏸️ ${escapeHtml(truncate(goal.pauseReason, 200))}`);
-	parts.push(`<i>${escapeHtml(truncate(goal.objective, 300))}</i>`);
-	parts.push(`<i>${escapeHtml(usage)}</i>`);
-	return parts.join("\n");
+export function goalLineHtml(goal: GoalSnapshot, news: GoalNews): Localized {
+	return (lang) => {
+		const usage = [
+			`${formatCount(goal.tokensUsed)} tok`,
+			goal.tokenBudget ? `/ ${formatCount(goal.tokenBudget)}` : undefined,
+			goal.activeSeconds ? formatDuration(goal.activeSeconds * 1000) : undefined,
+		]
+			.filter(Boolean)
+			.join(" ");
+		const parts = [`🎯 <b>goal</b> <i>(${goalNewsLabel(lang, news)})</i> ${goalStatusLabel(goal.status)}${goal.autoContinue ? ` ${pick(lang, "<i>· 자동 계속</i>", "<i>· auto-continue</i>")}` : ""}`];
+		if (goal.tasksTotal) parts.push(pick(lang, `작업 ${goal.tasksDone}/${goal.tasksTotal}`, `tasks ${goal.tasksDone}/${goal.tasksTotal}`));
+		if (goal.pauseReason) parts.push(`⏸️ ${escapeHtml(truncate(goal.pauseReason, 200))}`);
+		parts.push(`<i>${escapeHtml(truncate(goal.objective, 300))}</i>`);
+		parts.push(`<i>${escapeHtml(usage)}</i>`);
+		return parts.join("\n");
+	};
 }
 
 /** The `/tg goal` card. */
-export function goalCardHtml(goal: GoalSnapshot | undefined, focus?: FocusState): string {
-	if (!goal) {
-		const focusNote = focus ? `\n현재 focused goal: ${inlineCode(focus.goalId ?? "없음")}${focus.reason ? ` (${escapeHtml(focus.reason)})` : ""}` : "";
-		return [
-			`🎯 <b>goal</b>`,
-			`이 세션에서 추적 중인 goal이 없어요. pi-goal-x가 설치돼 있으면 ${inlineCode("/goal-direct <목표>")}로 바로 시작할 수 있어요.`,
-			`pi-goal-x 명령은 그대로 쓸 수 있어요: ${inlineCode("/goal-status · /goal-pause · /goal-resume · /goal-clear · /goal-list")}`,
-			`<i>확인 대화상자는 pi 터미널에 뜨니, 원격에서는 확인이 필요한 명령(예: /goal-clear)을 쓸 때 조심하세요.</i>`,
-			focusNote,
+export function goalCardHtml(goal: GoalSnapshot | undefined, focus?: FocusState): Localized {
+	return (lang) => {
+		if (!goal) {
+			const focusNote = focus
+				? `\n${pick(lang, "현재 focused goal", "focused goal")}: ${inlineCode(focus.goalId ?? pick(lang, "없음", "none"))}${focus.reason ? ` (${escapeHtml(focus.reason)})` : ""}`
+				: "";
+			return [
+				`🎯 <b>goal</b>`,
+				pick(
+					lang,
+					`이 세션에서 추적 중인 goal이 없어요. pi-goal-x가 설치돼 있으면 ${inlineCode("/goal-direct <목표>")}로 바로 시작할 수 있어요.`,
+					`nothing is being tracked as a goal in this session. If pi-goal-x is installed, ${inlineCode("/goal-direct <objective>")} starts one.`,
+				),
+				pick(lang, `pi-goal-x 명령은 그대로 쓸 수 있어요: ${inlineCode("/goal-status · /goal-pause · /goal-resume · /goal-clear · /goal-list")}`, `pi-goal-x's own commands still work: ${inlineCode("/goal-status · /goal-pause · /goal-resume · /goal-clear · /goal-list")}`),
+				pick(
+					lang,
+					`<i>확인 대화상자는 pi 터미널에 뜨니, 원격에서는 확인이 필요한 명령(예: /goal-clear)을 쓸 때 조심하세요.</i>`,
+					`<i>confirmation dialogs open in the pi terminal, so be careful with commands that ask to confirm (like /goal-clear) when you are away from the machine.</i>`,
+				),
+				focusNote,
+			]
+				.filter(Boolean)
+				.join("\n");
+		}
+		const usage = [
+			`${formatCount(goal.tokensUsed)} tokens`,
+			goal.tokenBudget ? pick(lang, `예산 ${formatCount(goal.tokenBudget)}`, `budget ${formatCount(goal.tokenBudget)}`) : undefined,
+			pick(lang, `활동 ${formatDuration(goal.activeSeconds * 1000)}`, `active ${formatDuration(goal.activeSeconds * 1000)}`),
 		]
 			.filter(Boolean)
-			.join("\n");
-	}
-	const usage = [
-		`${formatCount(goal.tokensUsed)} tokens`,
-		goal.tokenBudget ? `예산 ${formatCount(goal.tokenBudget)}` : undefined,
-		`활동 ${formatDuration(goal.activeSeconds * 1000)}`,
-	]
-		.filter(Boolean)
-		.join(" · ");
-	const lines = [
-		`🎯 <b>goal</b> ${goalStatusLabel(goal.status)}${goal.autoContinue ? " <i>· 자동 계속</i>" : ""}${goal.ordered ? " <i>· 순차</i>" : ""}`,
-		`id ${inlineCode(truncate(goal.id, 40))} · rev ${inlineCode(String(goal.revision ?? 0))}${goal.updatedAt ? ` · ${escapeHtml(goal.updatedAt.slice(0, 19).replace("T", " "))}` : ""}`,
-		`<b>목표</b>\n${escapeHtml(truncate(goal.objective, 1200))}`,
-		`사용량 ${escapeHtml(usage)}`,
-	];
-	if (goal.tasksTotal) {
-		lines.push(`작업 ${goal.tasksDone}/${goal.tasksTotal}${goal.currentTask ? ` · 진행 중: ${inlineCode(truncate(goal.currentTask, 40))}` : ""}`);
-	}
-	if (goal.pauseReason) lines.push(`⏸️ 중단 사유: ${escapeHtml(truncate(goal.pauseReason, 400))}${goal.pauseAction ? `\n권장 조치: ${escapeHtml(truncate(goal.pauseAction, 300))}` : ""}`);
-	if (goal.stopReason) lines.push(`stop reason: ${inlineCode(goal.stopReason)}`);
-	lines.push(`<i>pi에서 ${inlineCode("/goal-pause · /goal-resume · /goal-tweak · /goal-clear")} — Telegram에서 보내도 동작하지만 확인 상자는 터미널에 떠요.</i>`);
-	return lines.join("\n");
+			.join(" · ");
+		const lines = [
+			`🎯 <b>goal</b> ${goalStatusLabel(goal.status)}${goal.autoContinue ? ` ${pick(lang, "<i>· 자동 계속</i>", "<i>· auto-continue</i>")}` : ""}${goal.ordered ? ` ${pick(lang, "<i>· 순차</i>", "<i>· sequential</i>")}` : ""}`,
+			`id ${inlineCode(truncate(goal.id, 40))} · rev ${inlineCode(String(goal.revision ?? 0))}${goal.updatedAt ? ` · ${escapeHtml(goal.updatedAt.slice(0, 19).replace("T", " "))}` : ""}`,
+			`<b>${pick(lang, "목표", "objective")}</b>\n${escapeHtml(truncate(goal.objective, 1200))}`,
+			`${pick(lang, "사용량", "used")} ${escapeHtml(usage)}`,
+		];
+		if (goal.tasksTotal) {
+			lines.push(
+				pick(lang, `작업 ${goal.tasksDone}/${goal.tasksTotal}`, `tasks ${goal.tasksDone}/${goal.tasksTotal}`) +
+					(goal.currentTask ? ` · ${pick(lang, "진행 중", "current")}: ${inlineCode(truncate(goal.currentTask, 40))}` : ""),
+			);
+		}
+		if (goal.pauseReason)
+			lines.push(`⏸️ ${pick(lang, "중단 사유", "why it paused")}: ${escapeHtml(truncate(goal.pauseReason, 400))}${goal.pauseAction ? `\n${pick(lang, "권장 조치", "suggested next step")}: ${escapeHtml(truncate(goal.pauseAction, 300))}` : ""}`);
+		if (goal.stopReason) lines.push(`stop reason: ${inlineCode(goal.stopReason)}`);
+		lines.push(
+			`<i>${pick(
+				lang,
+				`pi에서 ${inlineCode("/goal-pause · /goal-resume · /goal-tweak · /goal-clear")} — Telegram에서 보내도 동작하지만 확인 상자는 터미널에 떠요.`,
+				`in pi: ${inlineCode("/goal-pause · /goal-resume · /goal-tweak · /goal-clear")} — they work from Telegram too, but the confirmation boxes appear in the terminal.`,
+			)}</i>`,
+		);
+		return lines.join("\n");
+	};
 }
 
 /** Dig a goal record out of a tool result / session message, looking only where pi-goal-x puts it. */

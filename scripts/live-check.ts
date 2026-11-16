@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const CHAT = 555000111;
+const EN_CHAT = 555000222;
 const TOKEN = "123456:LOCAL-CHECK-TOKEN-not-a-real-bot";
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-tg-live-agent-"));
@@ -43,7 +44,17 @@ if (srcAgent) {
 const workDir = mkdtempSync(join(tmpdir(), "pi-tg-live-work-"));
 writeFileSync(
 	join(agentDir, "telegram.json"),
-	JSON.stringify({ token: TOKEN, chats: [{ chatId: CHAT, label: "live check" }], verbosity: 2, streaming: true, announce: false }),
+	JSON.stringify({
+		token: TOKEN,
+		chats: [
+			{ chatId: CHAT, label: "live check" },
+			// a second phone that pinned english: what the bridge says there must follow it
+			{ chatId: EN_CHAT, label: "english check", lang: "en" },
+		],
+		verbosity: 2,
+		streaming: true,
+		announce: false,
+	}),
 	"utf8",
 );
 
@@ -157,6 +168,13 @@ function scrub(text: string): string {
 function shape(text: string): string {
 	return mask ? text.replace(/\p{L}+/gu, "··").replace(/\s+/g, " ").slice(0, 200) : text.slice(0, 200);
 }
+function repliesTo(chatId: number): string[] {
+	return calls
+		.filter((call) => (call.method === "sendMessage" || call.method === "editMessageText") && Number(call.params.chat_id) === chatId)
+		.map((call) => String(call.params.text ?? "").replace(/\s+/g, " ").trim())
+		.filter((text) => text.length > 0);
+}
+
 function replies(): string[] {
 	return calls
 		.filter((call) => call.method === "sendMessage" || call.method === "editMessageText")
@@ -677,6 +695,37 @@ if (goalPackageLoaded && process.env.PI_TG_LIVE_GOAL === "1") {
 		check("/tg goal shows the objective pi-goal-x created", cardArrived && /live-check goal for pi-telegram/.test(card), scrub(card).slice(0, 300));
 	}
 }
+
+// A second phone pinned english gets the whole bridge in english — the cards, keyboards and
+// notices built against a real pi session, not a fake one. A language switch notice is exempt: it
+// names the language it just switched to, in that language, which is the proof the pin took.
+send(EN_CHAT, "/help");
+const enHelp = await waitFor(() => repliesTo(EN_CHAT).some((text) => /<b>(session|models|running|status|bridge)/.test(text)), 20_000);
+check("an english chat reads the command help in english", enHelp, scrub(repliesTo(EN_CHAT).at(-1) ?? "").slice(0, 240));
+const enLangBefore = repliesTo(EN_CHAT).length;
+send(EN_CHAT, "/tg lang");
+await waitFor(() => repliesTo(EN_CHAT).length > enLangBefore, 20_000);
+check(
+	"the language card explains itself in the language it is talking in",
+	/english/i.test(repliesTo(EN_CHAT).at(-1) ?? ""),
+	scrub(repliesTo(EN_CHAT).at(-1) ?? "").slice(0, 240),
+);
+const enGoalBefore = repliesTo(EN_CHAT).length;
+send(EN_CHAT, "/tg goal");
+await waitFor(() => repliesTo(EN_CHAT).length > enGoalBefore, 20_000);
+const enModelBefore = repliesTo(EN_CHAT).length;
+send(EN_CHAT, "/model");
+await waitFor(() => repliesTo(EN_CHAT).slice(enModelBefore).some((text) => /<b>model<\/b>/.test(text)), 25_000);
+const enTexts = calls
+	.filter((call) => (call.method === "sendMessage" || call.method === "editMessageText") && Number(call.params.chat_id) === EN_CHAT)
+	.map((call) => String(call.params.text ?? ""))
+	.filter((text) => text.length > 0);
+const enWrong = enTexts.filter((text) => !text.startsWith("🌐") && /\p{Script=Hangul}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Han}/u.test(text));
+check(
+	`an english chat never hears the bridge in another script (${enTexts.length} messages)`,
+	enWrong.length === 0,
+	JSON.stringify(enWrong.map((text) => scrub(text).slice(0, 90)).slice(0, 3)),
+);
 
 // Anything the bridge generates about a failure must be safe to read on a phone: provider errors
 // often quote the request, which contains the key and a signed URL path. Only bridge-generated

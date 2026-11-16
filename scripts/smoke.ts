@@ -516,6 +516,17 @@ async function waitFor(description: string, predicate: () => boolean, timeoutMs 
 	}
 }
 
+/** Like waitFor, but reports a miss instead of throwing, so the check after it can print what arrived. */
+async function settle(description: string, predicate: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		if (predicate()) return true;
+		await sleep(60);
+	}
+	console.log(`  ..   no answer within ${Math.round(timeoutMs / 1000)}s: ${description}`);
+	return false;
+}
+
 let failures = 0;
 let checks = 0;
 function check(description: string, ok: boolean, detail = ""): void {
@@ -945,8 +956,8 @@ pushMessage(CHAT, "read this file", { document: { file_id: "doc1", file_name: "n
 await waitFor("text document inlined", () => promptText().includes("Attached file from Telegram: notes.md"));
 check("text document inlined as a prompt", promptText().includes("```"), promptText().slice(-160));
 pushMessage(CHAT, "here is an archive", { document: { file_id: "bin1", file_name: "app.zip", mime_type: "application/zip", file_size: 900 } });
-await waitFor("unsupported attachment notice", () => textMessages("unsupported attachment").length > 0);
-const unsupportedNote = String(textMessages("unsupported attachment").at(-1)?.params.text ?? "");
+await waitFor("unsupported attachment notice", () => textMessages("첨부한 파일을 읽을 수 없어요").length > 0, 12_000);
+const unsupportedNote = String(textMessages("첨부한 파일을 읽을 수 없어요").at(-1)?.params.text ?? "");
 check(
 	"unsupported attachment explained, not silently dropped",
 	unsupportedNote.includes("app.zip") && unsupportedNote.includes("경로를 알려주세요") && /\(900/.test(unsupportedNote),
@@ -958,8 +969,13 @@ check(
 	JSON.stringify(calls.filter((call) => /PDF/.test(String(call.params.text ?? ""))).map((call) => String(call.params.text).slice(0, 60))),
 );
 pushMessage(CHAT, "", { voice: { file_id: "v1", file_size: 10 } });
-await waitFor("voice notice", () => textMessages("voice messages are not transcribed").length > 0);
-check("voice messages explained", true);
+await waitFor("voice notice", () => textMessages("음성 메시지").length > 0, 12_000);
+const voiceNotice = String(textMessages("음성 메시지").at(-1)?.params.text ?? "");
+check(
+	"a voice message is refused in the language that chat speaks",
+	/음성 메시지는 텍스트로 바뀌지 않아요/u.test(voiceNotice) && !/voice messages/u.test(voiceNotice),
+	voiceNotice.slice(0, 160),
+);
 
 // 12. detail levels: long answers chunk, verbosity 2 mirrors thinking + results, 0 hides tools
 pushMessage(CHAT, "/stream off");
@@ -1057,27 +1073,154 @@ check("/tg pending reachable from Telegram", true);
 // 15b. the bridge speaks the language of the chat it is answering. Telegram names the language of the
 // user's client on every update; a chat can pin its own, and what was detected is remembered.
 const EN_CHAT = 555000999;
+// every update from this chat keeps saying its client speaks english — telegram says so on
+// every update, so a fixture that forgot would be testing the bridge against a lie
+const enOnly = { from: { id: 901, first_name: "Tester", language_code: "en-US" } };
 commandHandlers.get("telegram")?.(`add ${EN_CHAT}`, ctx);
 await waitFor("english chat paired", () => readFileSync(configPath, "utf8").includes(String(EN_CHAT)), 8000);
-pushMessage(EN_CHAT, "/tg lang", { from: { id: 901, first_name: "Tester", language_code: "en-US" } });
+pushMessage(EN_CHAT, "/tg lang", enOnly);
 await waitFor("the english chat hears english", () => textMessages("Language for this chat").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
 const enLang = String(textMessages("Language for this chat").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
 check("the client language telegram reports decides how the bridge talks", /detected from the language telegram reports/i.test(enLang), shapeText(enLang));
 check("an english-speaking chat never hears the bridge in korean", !/\p{Script=Hangul}/u.test(enLang), enLang.slice(0, 140));
 await waitFor("the detected language reaches the config", () => readFileSync(configPath, "utf8").includes('"tgLang": "en"'), 8000);
 check("what telegram told us survives a restart", readFileSync(configPath, "utf8").includes('"tgLang": "en"'));
-pushMessage(EN_CHAT, "/tg lang ko");
+pushMessage(EN_CHAT, "/tg lang ko", enOnly);
 await waitFor("that chat can pick korean for itself", () => textMessages("이 채팅은 이제 한국어").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
-pushMessage(EN_CHAT, "/tg lang en");
+pushMessage(EN_CHAT, "/tg lang en", enOnly);
 await waitFor("a pin reaches the config", () => readFileSync(configPath, "utf8").includes('"lang": "en"'), 8000);
 check("a chat can pin its own language", readFileSync(configPath, "utf8").includes('"lang": "en"'));
-pushMessage(EN_CHAT, "/tg lang auto");
+pushMessage(EN_CHAT, "/tg lang auto", enOnly);
 await waitFor("the pin comes back off", () => !readFileSync(configPath, "utf8").includes('"lang": "en"'), 8000);
 check("and hand it back to detection", !readFileSync(configPath, "utf8").includes('"lang": "en"'));
+await waitFor(
+	"the released chat goes back to what telegram reports",
+	() => textMessages("language pin").some((call) => Number(call.params.chat_id) === EN_CHAT),
+	12_000,
+);
+const afterRelease = String(textMessages("language pin").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
+check("letting go of a pin returns the chat to the language telegram reports", /speaks en right now/u.test(shapeText(afterRelease)) && !/\p{Script=Hangul}/u.test(afterRelease), afterRelease.slice(0, 160));
+// 15c. every other thing the bridge says follows the same rule — menus, cards, boards, notices.
+const enArchive = { document: { file_id: "bin2", file_name: "stuff.zip", mime_type: "application/zip", file_size: 900 }, ...enOnly };
+pushMessage(EN_CHAT, "here is an archive", enArchive);
+await waitFor("an english chat is told the same thing in english", () => textMessages("unsupported attachment").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
+const enUnsupportedNote = String(textMessages("unsupported attachment").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
+check(
+	"the same refusal, in the other language",
+	/unsupported attachment: stuff\.zip \(900/u.test(enUnsupportedNote) && /send me its path/u.test(enUnsupportedNote) && !/\p{Script=Hangul}/u.test(enUnsupportedNote),
+	enUnsupportedNote.slice(0, 180),
+);
+const enTexts = (marker: string) => textMessages(marker).filter((call) => Number(call.params.chat_id) === EN_CHAT);
+const enUnsupported = { document: { file_id: "bin2", file_name: "stuff.zip", mime_type: "application/zip", file_size: 900 }, ...enOnly };
+pushMessage(EN_CHAT, "here is an archive", enUnsupported);
+pushMessage(CHAT, "/verbose 1");
+await waitFor("detail 1 is set for the board checks", () => textMessages("도구 게시판").some((call) => Number(call.params.chat_id) === CHAT), 12_000);
+	const koVerbose = String(textMessages("detail 1 —").filter((call) => Number(call.params.chat_id) === CHAT).at(-1)?.params.text ?? "");
+	check("the detail card names the level in korean here", /답장 \+ 도구 게시판/.test(koVerbose), koVerbose.slice(0, 120));
+	pushMessage(EN_CHAT, "/verbose 1", enOnly);
+	await waitFor("the english chat gets its own detail card", () => textMessages("detail 1 —").some((call) => Number(call.params.chat_id) === EN_CHAT), 12_000);
+	const enVerbose = String(textMessages("detail 1 —").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
+	check("and names it in english there", /answers \+ live tool board/.test(enVerbose) && !/\p{Script=Hangul}/u.test(enVerbose), enVerbose.slice(0, 120));
+
+pushMessage(EN_CHAT, "/help", enOnly);
+pushMessage(CHAT, "/help");
+await waitFor(
+	"both chats get a help card",
+	() => enTexts("pi-telegram").length > 0 && textMessages("pi-telegram").some((call) => Number(call.params.chat_id) === CHAT),
+	12_000,
+);
+const enHelp = String(enTexts("pi-telegram").at(-1)?.params.text ?? "");
+const koHelp = String(
+	textMessages("pi-telegram")
+		.filter((call) => Number(call.params.chat_id) === CHAT)
+		.at(-1)?.params.text ?? "",
+);
+check("the help card speaks english to an english chat", /plain text becomes a pi prompt/.test(enHelp) && !enHelp.includes("일반 텍스트는"), enHelp.slice(-200));
+check("and korean to the chat that has always heard korean", koHelp.includes("일반 텍스트는"), koHelp.slice(-140));
+pushMessage(EN_CHAT, "/status", enOnly);
+await waitFor("english status card", () => enTexts("detail").length > 0, 12_000);
+const enStatus = String(enTexts("detail").at(-1)?.params.text ?? "");
+check("a status card never mixes two languages", !/\p{Script=Hangul}/u.test(enStatus), enStatus.slice(0, 220));
+pushMessage(EN_CHAT, "/tg goal", enOnly);
+await waitFor("english goal card", () => enTexts("🎯 <b>goal</b>").length > 0, 12_000);
+const enGoal = String(enTexts("🎯 <b>goal</b>").at(-1)?.params.text ?? "");
+check("the goal card follows the chat's language too", !/\p{Script=Hangul}/u.test(enGoal), enGoal.slice(0, 220));
+const enBoard = () =>
+	calls.filter(
+		(call) =>
+			(call.method === "sendMessage" || call.method === "editMessageText") &&
+			Number(call.params.chat_id) === EN_CHAT &&
+			/🔧 <b>(this turn|이번 턴)<\/b>/.test(String(call.params.text ?? "")),
+	);
+const enBoardBefore = enBoard().length;
+idle = false;
+emit("agent_start", { type: "agent_start" });
+emit("turn_start", { type: "turn_start", turnIndex: 0 });
+emit("tool_execution_start", { type: "tool_execution_start", toolCallId: "langturn0", toolName: "read", args: { path: "src/i18n.ts" } });
+emit("tool_execution_end", {
+	type: "tool_execution_end",
+	toolCallId: "langturn0",
+	toolName: "read",
+	result: { content: [{ type: "text", text: "ok" }] },
+	isError: false,
+	durationMs: 120,
+});
+await waitFor("the english chat gets a tool board", () => enBoard().length > enBoardBefore, 12_000);
+check("the live tool board is in the language of the chat that sees it", /this turn/.test(String(enBoard().at(-1)?.params.text ?? "")), String(enBoard().at(-1)?.params.text).slice(0, 180));
+emit("turn_end", {
+	type: "turn_end",
+	turnIndex: 0,
+	message: { role: "assistant", usage: { input: 900, output: 120, totalTokens: 1020, cost: { total: 0.001 } }, durationMs: 2_000 },
+});
+emit("agent_end", { type: "agent_end" });
+emit("agent_settled", { type: "agent_settled", aborted: false });
+idle = true;
+emit("session_before_compact", { type: "session_before_compact", preparation: {}, reason: "manual", willRetry: true });
+await waitFor("english compaction notice", () => enTexts("compacting the context").length > 0, 12_000);
+const enCompact = String(enTexts("compacting the context").at(-1)?.params.text ?? "");
+check(
+	"a compaction notice arrives in the chat's language, one fact per line",
+	enCompact.includes("/compact") && !/\p{Script=Hangul}/u.test(enCompact) && enCompact.split("\n").length >= 3,
+	enCompact.slice(0, 220),
+);
+emit("session_compact", { type: "session_compact", reason: "threshold", compactionEntry: { tokensBefore: 45_000 } });
+await waitFor("english compaction done notice", () => enTexts("context compacted").length > 0, 12_000);
+const enCompacted = String(enTexts("context compacted").at(-1)?.params.text ?? "");
+check(
+	"the line that says why pi compacted is translated too",
+	enCompacted.includes("compacted automatically at the context threshold") && !/\p{Script=Hangul}/u.test(enCompacted),
+	enCompacted.slice(0, 220),
+);
+check(
+	"the korean chat still hears its own compaction wording",
+	sentMessages("컨텍스트 압축 완료").some((call) => Number(call.params.chat_id) === CHAT),
+);
+pushMessage(EN_CHAT, "   ", enOnly);
+await waitFor("english empty hint", () => enTexts("send text or an image").length > 0, 12_000);
+check("even the empty-message hint is bilingual", !/\p{Script=Hangul}/u.test(String(enTexts("send text or an image").at(-1)?.params.text ?? "")), String(enTexts("send text or an image").at(-1)?.params.text).slice(0, 200));
 check(
 	"telegram's language codes are mapped honestly",
 	langFromTelegramCode("ko") === "ko" && langFromTelegramCode("en-GB") === "en" && langFromTelegramCode("ja") === "en" && langFromTelegramCode(undefined) === undefined,
 );
+// One invariant is worth more than string-by-string checks: while a chat is set to english,
+// nothing the bridge itself writes should come out in another script.
+const enChatTexts = calls
+	.filter(
+		(call) =>
+			(call.method === "sendMessage" || call.method === "editMessageText") &&
+			Number(call.params.chat_id) === EN_CHAT &&
+			String(call.params.text ?? "").length > 0,
+	)
+	.map((call) => String(call.params.text));
+// A notice about a language switch speaks the language it just switched to — that is the proof it
+// worked, so it is the one allowed exception to the rule.
+const wrongScript = enChatTexts.filter((text) => !text.startsWith("🌐") && /\p{Script=Hangul}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Han}/u.test(text));
+check(
+	`an english chat never hears the bridge in another script (${enChatTexts.length} messages)`,
+	wrongScript.length === 0,
+	JSON.stringify(wrongScript.map((text) => text.slice(0, 80)).slice(0, 3)),
+);
+
 pushMessage(CHAT, "/chats");
 await waitFor("chat list shows the english chat", () => textMessages("paired chats").some((call) => String(call.params.text).includes(String(EN_CHAT))), 12_000);
 const revokeEn = lastKeyboard("paired chats")
@@ -1086,6 +1229,10 @@ const revokeEn = lastKeyboard("paired chats")
 check("the chat list offers to revoke that chat", revokeEn !== undefined, JSON.stringify(lastKeyboard("paired chats")).slice(0, 200));
 pushCallback(CHAT, Number(textMessages("paired chats").at(-1)?.params.message_id ?? 0), revokeEn!.callback_data);
 await waitFor("english chat unpaired", () => !readFileSync(configPath, "utf8").includes(String(EN_CHAT)), 8000);
+// and pair it back: the rest of the run wants two phones again
+commandHandlers.get("telegram")?.(`add ${EN_CHAT}`, ctx);
+await waitFor("english chat paired again", () => readFileSync(configPath, "utf8").includes(String(EN_CHAT)), 8000);
+
 
 // 16. edited messages, empty messages
 pushEdited(CHAT, "i edited my message");
@@ -1261,10 +1408,10 @@ const flatten = (value: string) => value.replace(/<[^>]*>/g, "").replace(/\s+/g,
 	// 1. a registry far bigger than the usable list has to be mentioned, or nobody discovers they can type
 	const hidden = Array.from({ length: 20 }, (_unused, index) => shapeOf("bulkprov", index));
 	extraModels.push(...hidden);
-	const curatedBefore = sentMessages("available").filter((call) => call.params.reply_markup).length;
+	const curatedBefore = sentMessages("<b>model</b>").filter((call) => call.params.reply_markup).length;
 	pushMessage(CHAT, "/model");
-	await waitFor("model list mentioning the wider registry", () => sentMessages("available").filter((call) => call.params.reply_markup).length > curatedBefore);
-	const curatedNote = String(sentMessages("available").filter((call) => call.params.reply_markup).at(-1)?.params.text ?? "");
+	await waitFor("model list mentioning the wider registry", () => sentMessages("<b>model</b>").filter((call) => call.params.reply_markup).length > curatedBefore);
+	const curatedNote = String(sentMessages("<b>model</b>").filter((call) => call.params.reply_markup).at(-1)?.params.text ?? "");
 	check("a much wider registry is announced, pointing at typed references", curatedNote.includes("pi가 아는 모델은") && curatedNote.includes("provider/id"), curatedNote.slice(0, 160));
 
 	// 2. once the usable list itself is huge, `/model` drills down to providers instead of paging
@@ -1279,7 +1426,7 @@ const flatten = (value: string) => value.replace(/<[^>]*>/g, "").replace(/\s+/g,
 	const providerRows = buttons(keyboardOf(drill));
 	check(
 		"/model asks which provider when the list is too big to page",
-		providerRows.some((row) => row.text.includes("bulkprov · 65개")),
+		providerRows.some((row) => row.text.includes("bulkprov · 65")),
 		providerRows.slice(0, 3).map((row) => row.text).join(" | "),
 	);
 	check("the drill-down keeps individual models out of the way", !JSON.stringify(providerRows).includes("Bulk Model"), providerRows[0]?.text);
@@ -1318,15 +1465,20 @@ const flatten = (value: string) => value.replace(/<[^>]*>/g, "").replace(/\s+/g,
 		{ type: "chat", provider: "openrouter", id: "anthropic/claude-sonnet-4.5", name: "Claude Sonnet 4.5", baseUrl: "https://openrouter.ai/api/v1", contextWindow: 200_000, reasoning: true },
 	];
 	extraModels.push(...orModels);
+	const switchBefore = textMessages("\ud83d\udd00 model →").length;
+	const arrow = "🔀 model →";
 	pushMessage(CHAT, "/model nvidia/nemotron-3.5-super-vl:free");
-	await waitFor("aggregator id resolves to its provider", () => ctx.model.id === "nvidia/nemotron-3.5-super-vl:free" && ctx.model.provider === "openrouter", 8000);
-	const resolved = lastTextFor(CHAT);
+	await waitFor("the switch reply reaches the chat", () => textMessages(arrow).length > switchBefore, 8000);
+	const resolved = String(textMessages(arrow).at(-1)?.params.text ?? "");
+	check("pi applied the aggregator id", ctx.model.id === "nvidia/nemotron-3.5-super-vl:free" && ctx.model.provider === "openrouter", ctx.model.provider + "/" + ctx.model.id);
 	check("an openrouter-style id is applied directly, not searched", resolved.includes("🔀 model →") && resolved.includes("openrouter/nvidia/nemotron-3.5-super-vl:free"), resolved.slice(0, 140));
 	check("the bridge says how it read the typed id", resolved.includes("해석했어요"), resolved.slice(0, 160));
 	// an id nobody has registered yet borrows the shape of a sibling model from the same family
+	const cloneBefore = textMessages("\u2728").length;
 	pushMessage(CHAT, "/model nvidia/nemotron-9.9-brand-new:free");
 	await waitFor("unknown aggregator id clones the provider shape", () => ctx.model.id === "nvidia/nemotron-9.9-brand-new:free" && ctx.model.provider === "openrouter", 8000);
-	const cloned = lastTextFor(CHAT);
+	await waitFor("the borrowed-shape reply reaches the chat", () => textMessages("✨").length > cloneBefore, 8000);
+	const cloned = String(textMessages("✨").at(-1)?.params.text ?? "");
 	check("a brand new aggregator id is accepted with the borrowed shape", cloned.includes("✨") && cloned.includes("nvidia/nemotron-3.5-super-vl:free"), cloned.slice(0, 200));
 	extraModels.length = 0;
 	pushMessage(CHAT, "/model mock-model");
@@ -1344,14 +1496,29 @@ const flatten = (value: string) => value.replace(/<[^>]*>/g, "").replace(/\s+/g,
 		await emitAwait("session_shutdown", { type: "session_shutdown", reason: "new" });
 		await emitAwait("session_start", { type: "session_start", reason: "new" });
 	};
+	// typed on the english phone, but every paired chat hears the confirmation in its own words
+	const koNotice = "새 세션</b>이 열렸어요";
+	const enNewBefore = textMessages("a new session</b> is open").filter((call) => Number(call.params.chat_id) === EN_CHAT).length;
+	const koNewBefore = textMessages(koNotice).filter((call) => Number(call.params.chat_id) === CHAT).length;
 	pushMessage(CHAT, "/new");
 	await waitFor("new session ran through the replacing path", () => sessionOps.includes("newSession:replace"), 15_000);
-	const noticeText = "새 세션</b>이 열렸어요";
-	await waitFor("restart notice delivered by the reconnected bridge", () => textMessages(noticeText).length > 0, 15_000);
-	check("confirmation survives the session replacement", textMessages(noticeText).length > 0, lastTextFor(CHAT).slice(0, 160));
+	await waitFor("restart notice delivered by the reconnected bridge", () => textMessages(koNotice).length > 0, 15_000);
+	check("confirmation survives the session replacement", textMessages(koNotice).length > koNewBefore, lastTextFor(CHAT).slice(0, 160));
+	const enSaw = await settle("the english phone hears the same confirmation", () =>
+		textMessages("a new session</b> is open").filter((call) => Number(call.params.chat_id) === EN_CHAT).length > enNewBefore,
+		15_000,
+	);
+	check("every phone hears the confirmation that belongs to it", enSaw);
+	const enConfirmed = String(textMessages("a new session</b> is open").filter((call) => Number(call.params.chat_id) === EN_CHAT).at(-1)?.params.text ?? "");
+	const koConfirmed = String(textMessages(koNotice).filter((call) => Number(call.params.chat_id) === CHAT).at(-1)?.params.text ?? "");
+	check(
+		"and the words each phone got are the words that chat speaks",
+		!/\p{Script=Hangul}/u.test(enConfirmed) && /\p{Script=Hangul}/u.test(koConfirmed),
+		`${enConfirmed.slice(0, 70)} || ${koConfirmed.slice(0, 70)}`,
+	);
 	check("a replacement does not announce a stopped bridge", textMessages("bridge stopped").length === stoppedBefore, lastTextFor(CHAT).slice(0, 160));
 	await waitFor("notice cleared from config", () => !readFileSync(configPath, "utf8").includes("pendingNotice"), 5000);
-	check("queued notice is consumed once", true);
+	check("queued notice is consumed once", readFileSync(configPath, "utf8").includes("pendingNotice") === false);
 	ctx.newSession = originalNewSession;
 }
 
@@ -1412,9 +1579,10 @@ check("a menu overwritten by another program on the same token is called out", t
 shadowMenu = false;
 
 // 20g. pi rejects prompts while it compacts, so the bridge parks them and replays them afterwards
+const compactNoticesBefore = sentMessages("컨텍스트 압축 중").length;
 emit("session_before_compact", { type: "session_before_compact", preparation: {}, reason: "manual", willRetry: false });
-const compactNotice = await waitFor("compacting notice", () => sentMessages("컨텍스트 압축 중").length > 0, 5000).then(
-	() => sentMessages("컨텍스트 압축 중")[0],
+const compactNotice = await waitFor("compacting notice", () => sentMessages("컨텍스트 압축 중").length > compactNoticesBefore, 5000).then(
+	() => sentMessages("컨텍스트 압축 중").at(-1),
 	() => undefined,
 );
 check("the chat is told pi is rebuilding its context", Boolean(compactNotice), "no 🗜 notice");
@@ -1426,9 +1594,10 @@ const promptsBeforeCompaction = userMessages.length;
 pushMessage(CHAT, "압축 중에 보낸 메시지");
 await waitFor("held message notice", () => sentMessages("컨텍스트를 압축/요약 중").length > 0);
 check("a prompt sent during compaction is never thrown at pi", userMessages.length === promptsBeforeCompaction, `+${userMessages.length - promptsBeforeCompaction}`);
+const compactDoneNoticesBefore = sentMessages("컨텍스트 압축 완료").length;
 emit("session_compact", { type: "session_compact", compactionEntry: { tokensBefore: 45_000 }, reason: "manual", willRetry: false });
-const compactDone = await waitFor("compaction done notice", () => sentMessages("컨텍스트 압축 완료").length > 0, 5000).then(
-	() => sentMessages("컨텍스트 압축 완료")[0],
+const compactDone = await waitFor("compaction done notice", () => sentMessages("컨텍스트 압축 완료").length > compactDoneNoticesBefore, 5000).then(
+	() => sentMessages("컨텍스트 압축 완료").at(-1),
 	() => undefined,
 );
 check("the chat learns the compaction finished and how much it saved", String(compactDone?.params.text ?? "").includes("45.0k → 42.0k"), shapeText(String(compactDone?.params.text ?? "")));
@@ -1438,10 +1607,11 @@ await waitFor("held prompt delivered after compaction", () => userMessages.lengt
 check("the parked prompt reaches pi once compaction finishes", userMessages.length > promptsBeforeCompaction);
 await waitFor("flush notice", () => sentMessages("압축 끝 — 기다리던 메시지").length > 0);
 check("the chat learns that the parked message was delivered", true);
+const compactFailNoticesBefore = sentMessages("컨텍스트 압축 실패").length;
 emit("session_before_compact", { type: "session_before_compact", preparation: {}, reason: "threshold", willRetry: true });
 emit("session_compact_failed", { type: "session_compact_failed", reason: "threshold", errorMessage: "Compaction failed: provider said no", aborted: false, willRetry: true });
-const compactFailed = await waitFor("compaction failure notice", () => sentMessages("컨텍스트 압축 실패").length > 0, 5000).then(
-	() => sentMessages("컨텍스트 압축 실패")[0],
+const compactFailed = await waitFor("compaction failure notice", () => sentMessages("컨텍스트 압축 실패").length > compactFailNoticesBefore, 5000).then(
+	() => sentMessages("컨텍스트 압축 실패").at(-1),
 	() => undefined,
 );
 check("a failed compaction is reported, not left silent", String(compactFailed?.params.text ?? "").includes("provider said no") && String(compactFailed?.params.text ?? "").includes("컨텍스트 임계값"), shapeText(String(compactFailed?.params.text ?? "")));

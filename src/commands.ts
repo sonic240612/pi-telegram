@@ -9,8 +9,8 @@
 import type { CallbackActionKind, CallbackEntry, CallbackResult, Hub, ListSpec, SendOptions } from "./hub.ts";
 import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, tgDebug, truncate } from "./format.ts";
 import { goalCardHtml, goalStatusLabel } from "./goal.ts";
-import { L, pick } from "./i18n.ts";
-import type { Localized } from "./i18n.ts";
+import { L, pick, render } from "./i18n.ts";
+import type { Lang, Localized } from "./i18n.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
 export interface CommandInvocation {
@@ -86,11 +86,19 @@ interface ListItem {
 }
 
 interface ListRender {
-	title: string;
+	title: Localized;
 	items: ListItem[];
 	perPage: number;
 	columns: number;
-	note?: string;
+	note?: Localized;
+}
+
+/**
+ * Assemble one message out of pieces that may each be plain or per-chat, so a reply can be built once
+ * and rendered in whichever language the chat turns out to speak.
+ */
+function joinLines(parts: Localized[]): (lang: Lang) => string {
+	return (lang) => parts.map((part) => (typeof part === "string" ? part : part(lang))).join(String.fromCharCode(10));
 }
 
 export class CommandLayer {
@@ -181,26 +189,34 @@ export class CommandLayer {
 	// ---------------------------------------------------------------- text commands
 
 	private async help(chatId: number): Promise<void> {
-		const sections: [string, string][] = [
-			["세션", "/new · /resume [검색어] · /fork [메시지] · /tree · /rename <이름> · /export · /compact [지시]"],
-			["모델·도구", "/model [이름·검색어] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<이름>]"],
-			["실행 제어", "/abort · /steer <메시지> · /queue <메시지> · /bash <셸 명령>"],
-			["상태·표시", "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
-			["브리지", "/pair · /chats · /pending · /unpair <채팅id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|stats|menu|redact|goal|lang"],
+		// the section labels follow the chat; the command list itself is the same either way
+		const sections: [Localized, string][] = [
+			[L("세션", "session"), "/new · /resume [search] · /fork [message] · /tree · /rename <name> · /export · /compact [note]"],
+			[L("모델·도구", "models & tools"), "/model [name|search] · /thinking [off|minimal|low|medium|high] · /tools [list|on|off|reset|<name>]"],
+			[L("실행", "running a turn"), "/abort · /steer <message> · /queue <message> · /bash <shell command>"],
+			[L("상태·표시", "status & display"), "/status · /usage · /commands · /skills · /verbose [0|1|2] · /stream [on|off] · /ping · /stats"],
+			[L("브리지", "the bridge itself"), "/pair · /chats · /pending · /unpair <chat id> · /restart · /tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal"],
 		];
-		const body = sections.map(([title, list]) => `<b>${title}</b>\n${list}`).join("\n\n");
-		const notes = [
+		const body = (lang: Lang) => sections.map(([title, list]) => `<b>${escapeHtml(render(title, lang))}</b>\n${list}`).join("\n\n");
+		const notes: Localized[] = [
 			"",
-			"<i>일반 텍스트는 그대로 pi 프롬프트, 이미지와 텍스트·코드 파일은 첨부로 전달돼요. PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요.</i>",
-			"<i>pi 확장·스킬·프롬프트 템플릿 명령도 그대로 동작: /review, /skill:pdf, /mytemplate …</i>",
-			"<i>자동완성에 안 보이는 명령도 그대로 쳐면 동작해요. 자동완성 목록이 이상하면 /tg menu</i>",
+			L("<i>일반 텍스트는 그대로 pi 프롬프트, 이미지와 텍스트·코드 파일은 첨부로 전달돼요. PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요.</i>", "<i>plain text becomes a pi prompt exactly as typed; images and text/code files arrive as attachments. For PDFs, spreadsheets and the like, keep the file on the machine and tell me its path.</i>"),
+			L("<i>pi 확장·스킬·프롬프트 템플릿 명령도 그대로 동작: /review, /skill:pdf, /mytemplate …</i>", "<i>pi extension, skill and prompt-template commands work here too: /review, /skill:pdf, /mytemplate …</i>"),
+			L("<i>자동완성에 안 보이는 명령도 그대로 쳐면 동작해요. 자동완성 목록이 이상하면 /tg menu</i>", "<i>a command missing from autocomplete still works when typed. If that list looks wrong, /tg menu</i>"),
 		];
 		const rows: TgInlineKeyboardButton[][] = [
 			["model", "thinking", "tools"].map((name) => this.menuButton(chatId, `🧠 ${name}`, name)),
 			["commands", "skills", "resume"].map((name) => this.menuButton(chatId, `⌨️ ${name}`, name)),
 			["status", "usage", "verbose 2"].map((name) => this.menuButton(chatId, `📊 ${name.trim()}`, name)),
 		];
-		await this.say(chatId, `<b>pi-telegram</b>\n\n${body}${notes.join("\n")}`, { keyboard: rows });
+		await this.say(
+			chatId,
+			(lang) => `<b>pi-telegram</b>
+
+${body(lang)}
+${joinLines(notes)(lang)}`,
+			{ keyboard: rows },
+		);
 	}
 
 	private async rootMenu(chatId: number): Promise<void> {
@@ -224,7 +240,8 @@ export class CommandLayer {
 		const info = this.hub.sessionInfo();
 		const usage = this.hub.contextUsage();
 		const active = this.hub.listTools().filter((tool) => tool.active).map((tool) => tool.name);
-		const lines = [
+		const goal = this.hub.goalState().goal;
+		const parts: Localized[] = [
 			`🤖 <b>${escapeHtml(this.hub.botName())}</b> ↔ pi`,
 			`model ${inlineCode(this.hub.currentModelKey() ?? "none")}`,
 			`thinking ${inlineCode(this.hub.thinkingLevel())}`,
@@ -234,17 +251,15 @@ export class CommandLayer {
 			`entries ${inlineCode(String(info.entries))} · messages ${inlineCode(String(info.messages))}`,
 			`context ${inlineCode(usage?.percent != null ? `${usage.percent.toFixed(1)}%` : usage?.tokens != null ? `${formatCount(usage.tokens)} tok` : "unknown")}`,
 			`tools ${inlineCode(active.join(", ") || "none")}`,
-			`detail ${inlineCode(String(this.hub.verbosity()))} · drafts ${inlineCode(this.hub.cfg.streaming ? "on" : "off")} · 도구 ${inlineCode(this.hub.cfg.activityLive ? "실시간" : "마지막 요약")} · ${inlineCode(this.hub.isIdle() ? "idle" : "running")}`,
+			(lang) =>
+				`detail ${inlineCode(String(this.hub.verbosity()))} · ${pick(lang, "초안", "drafts")} ${inlineCode(this.hub.cfg.streaming ? "on" : "off")} · ${pick(lang, `도구 ${this.hub.cfg.activityLive ? "실시간" : "마지막 요약"}`, `tools ${this.hub.cfg.activityLive ? "live" : "summarised at turn end"}`)} · ${inlineCode(this.hub.isIdle() ? "idle" : "running")}`,
 		];
-		const goal = this.hub.goalState().goal;
 		// A goal is the one thing /status cannot show from pi's own state, and the one thing a phone
 		// user most needs to see while pi runs unattended.
 		if (goal) {
-			lines.push(
-				`goal ${goalStatusLabel(goal.status)} ${inlineCode(truncate(goal.id, 24))}${goal.tasksTotal ? ` · ${goal.tasksDone}/${goal.tasksTotal}` : ""} · ${formatCount(goal.tokensUsed)} tok <i>(/tg goal)</i>`,
-			);
+			parts.push(`goal ${goalStatusLabel(goal.status)} ${inlineCode(truncate(goal.id, 24))}${goal.tasksTotal ? ` · ${goal.tasksDone}/${goal.tasksTotal}` : ""} · ${formatCount(goal.tokensUsed)} tok <i>(/tg goal)</i>`);
 		}
-		await this.say(chatId, lines.join("\n"));
+		await this.say(chatId, joinLines(parts));
 	}
 
 	private async model(chatId: number, args: string): Promise<void> {
@@ -265,7 +280,15 @@ export class CommandLayer {
 					// aggregator whose ids embed the manufacturer): use the provider's shape as-is.
 					return this.applyModelRef(chatId, query);
 				}
-				await this.say(chatId, `⚠️ 일치하는 모델이 없어요: ${inlineCode(query)}\n목록은 ${inlineCode("/model")}, 특정 모델은 ${inlineCode("provider/id")}를 정확히 입력하면 그대로 사용해요.`);
+				await this.say(chatId, (lang) => {
+					const head = pick(lang, `⚠️ 일치하는 모델이 없어요: ${inlineCode(query)}`, `⚠️ no model matches: ${inlineCode(query)}`);
+					const hint = pick(
+						lang,
+						`${inlineCode("/model")} ${pick(lang, "목록에서 고르거나", "shows the list; or")} ${inlineCode("provider/id")} ${pick(lang, "를 그대로 치면 그 id를 바로 써요.", "typed exactly is used as written.")}`,
+						`${inlineCode("/model")} shows the list; type the exact ${inlineCode("provider/id")} and that id is used as written.`,
+					);
+					return `${head}\n${hint}`;
+				});
 				return;
 			}
 			return this.renderList(chatId, { list: "model", args: query, page: 0 });
@@ -281,25 +304,27 @@ export class CommandLayer {
 	private async applyModelRef(chatId: number, key: string, typed?: string): Promise<void> {
 		const result = await this.hub.setModelByKey(key);
 		if (!result.ok) {
-			await this.say(chatId, `⚠️ 모델 변경 실패: ${escapeHtml(result.error ?? "unknown")}`);
+			await this.say(chatId, (lang) => `⚠️ ${pick(lang, "모델 변경 실패", "could not change the model")}: ${escapeHtml(result.error ? render(result.error, lang) : "unknown")}`);
 			return;
 		}
 		const applied = result.resolved ?? key;
 		const asked = (typed ?? key).toLowerCase();
-		const renamed = applied.toLowerCase() !== asked ? `\n· ${inlineCode(typed ?? key)} → ${inlineCode(applied)}로 해석했어요.` : "";
-		const note = result.custom ? `\n✨ pi가 처음 보는 id예요 — 같은 provider의 ${inlineCode(result.custom.template)} 설정을 그대로 사용했어요.` : "";
-		await this.say(chatId, `🔀 model → ${inlineCode(applied)}${renamed}${note}`);
+		await this.say(chatId, (lang) => {
+			const renamed = applied.toLowerCase() !== asked ? `\n· ${inlineCode(typed ?? key)} → ${inlineCode(applied)} ${pick(lang, "로 해석했어요", "resolved to this")}` : "";
+			const note = result.custom ? `\n✨ ${pick(lang, `pi가 처음 보는 id예요 — 같은 provider의 ${inlineCode(result.custom!.template)} 설정을 그대로 사용했어요.`, `pi has never seen this id — borrowed the settings of ${inlineCode(result.custom!.template)} from the same provider.`)}` : "";
+			return `🔀 model → ${inlineCode(applied)}${renamed}${note}`;
+		});
 	}
 
 	private async thinking(chatId: number, args: string): Promise<void> {
 		const level = args.trim().toLowerCase();
 		if (level) {
 			if (!THINKING_LEVELS.includes(level)) {
-				await this.say(chatId, `⚠️ 레벨 선택: ${THINKING_LEVELS.map((entry) => inlineCode(entry)).join(" ")}`);
+				await this.say(chatId, (lang) => `⚠️ ${pick(lang, "레벨 선택", "pick a level")}: ${THINKING_LEVELS.map((entry) => inlineCode(entry)).join(" ")}`);
 				return;
 			}
 			const result = this.hub.setThinkingLevel(level);
-			await this.say(chatId, result.ok ? `🧠 thinking → ${inlineCode(level)}` : `⚠️ thinking 변경 실패: ${escapeHtml(result.error ?? "unknown")}`);
+			await this.say(chatId, (lang) => (result.ok ? `🧠 thinking → ${inlineCode(level)}` : `⚠️ ${pick(lang, "thinking 변경 실패", "could not change thinking")}: ${escapeHtml(result.error ? render(result.error, lang) : "unknown")}`));
 			return;
 		}
 		await this.renderThinking(chatId);
@@ -308,46 +333,46 @@ export class CommandLayer {
 	private async renderThinking(chatId: number): Promise<void> {
 		const current = this.hub.thinkingLevel();
 		const rows = [THINKING_LEVELS.map((level) => ({ text: `${level === current ? "● " : ""}${level}`, callback_data: this.hub.createToken({ kind: "thinking:pick", value: level }, chatId) }))];
-		await this.say(chatId, `<b>thinking level</b> · current ${inlineCode(current)}\n모델이 지원하지 않는 레벨은 자동으로 제한됩니다.`, { keyboard: rows });
+		await this.say(chatId, (lang) => `<b>thinking level</b> · ${pick(lang, "현재", "current")} ${inlineCode(current)}\n${pick(lang, "모델이 지원하지 않는 레벨은 자동으로 제한됩니다.", "levels a model cannot do are capped automatically.")}`, { keyboard: rows });
 	}
 
 	private async compact(chatId: number, args: string): Promise<void> {
 		const result = this.hub.compactRun(args.trim() || undefined);
-		await this.say(chatId, result.ok ? `🗜️ 압축 시작${args.trim() ? ` · ${inlineCode(truncate(args.trim(), 120))}` : ""}` : `⚠️ compact 실패: ${escapeHtml(result.error ?? "unknown")}`);
+		await this.say(chatId, (lang) => (result.ok ? `🗜️ ${pick(lang, "압축 시작", "compaction started")}${args.trim() ? ` · ${inlineCode(truncate(args.trim(), 120))}` : ""}` : `⚠️ compact ${pick(lang, "실패", "failed")}: ${escapeHtml(result.error ? render(result.error, lang) : "unknown")}`));
 	}
 
 	private async newSession(chatId: number): Promise<void> {
-		await this.say(chatId, "🆕 새 세션 여는 중…");
+		await this.say(chatId, L("🆕 새 세션 여는 중…", "🆕 opening a new session…"));
 		// /new disposes the pi session and re-creates this extension, so this instance cannot confirm;
 		// the notice is queued for the bridge instance that comes back up.
-		const notice = this.hub.notifyAfterRestart("🆕 <b>새 세션</b>이 열렸어요. 여기서 이어서하면 돼요.");
+		const notice = this.hub.notifyAfterRestart(L("🆕 <b>새 세션</b>이 열렸어요. 여기서 이어서하면 돼요.", "🆕 <b>a new session</b> is open. Carry on from here."));
 		try {
 			await this.hub.withCommandContext(async (ctx) => {
 				await ctx.newSession();
 			});
 			this.hub.clearPendingNotice(notice);
-			await this.say(chatId, "✅ 새 세션이 열렸어요.");
+			await this.say(chatId, L("✅ 새 세션이 열렸어요.", "✅ the new session is open."));
 		} catch (error) {
 			this.hub.clearPendingNotice(notice);
-			await this.quietSay(chatId, `⚠️ 새 세션 실패: ${escapeHtml(safeError(error))}`);
+			await this.quietSay(chatId, (lang) => `⚠️ ${pick(lang, "새 세션 실패", "the new session failed")}: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
 	private async rename(chatId: number, args: string): Promise<void> {
 		const name = args.trim();
 		if (!name) {
-			await this.say(chatId, `현재 이름 ${inlineCode(this.hub.sessionName() ?? "(none)")}\n사용법: ${inlineCode("/rename 이름")}`);
+			await this.say(chatId, (lang) => `${pick(lang, "현재 이름", "current name")} ${inlineCode(this.hub.sessionName() ?? "(none)")}\n${pick(lang, "사용법", "usage")}: ${inlineCode("/rename 이름")}`);
 			return;
 		}
 		this.hub.setSessionName(name);
-		await this.say(chatId, `🏷 이름 → ${inlineCode(name)}`);
+		await this.say(chatId, `🏷 ${pick(this.hub.lang(chatId), "이름", "name")} → ${inlineCode(name)}`);
 	}
 
 	private async usage(chatId: number): Promise<void> {
 		const usage = this.hub.contextUsage();
 		const info = this.hub.sessionInfo();
 		if (!usage) {
-			await this.say(chatId, `📊 컨텍스트 사용량을 아직 계산할 수 없어요 (첫 응답 전일 수 있음).\nentries ${inlineCode(String(info.entries))}`);
+			await this.say(chatId, (lang) => `📊 ${pick(lang, "컨텍스트 사용량을 아직 계산할 수 없어요 (pi가 처음 답하기 전일 수 있어요).", "context usage is not computed yet (pi may not have answered yet).")}\nentries ${inlineCode(String(info.entries))}`);
 			return;
 		}
 		const percent = usage.percent ?? 0;
@@ -364,7 +389,7 @@ export class CommandLayer {
 			const tools = this.hub.listTools();
 			const target = tools.find((tool) => tool.name.toLowerCase() === query.toLowerCase());
 			if (!target) {
-				await this.say(chatId, `⚠️ 도구 없음: ${inlineCode(query)}`);
+				await this.say(chatId, (lang) => `⚠️ ${pick(lang, "도구 없음", "no such tool")}: ${inlineCode(query)}`);
 				return;
 			}
 			const active = tools.filter((tool) => tool.active).map((tool) => tool.name);
@@ -378,28 +403,32 @@ export class CommandLayer {
 
 	private async abort(chatId: number): Promise<void> {
 		if (this.hub.isIdle()) {
-			await this.say(chatId, "이미 idle 이에요.");
+			await this.say(chatId, L("이미 idle 이에요.", "already idle."));
 			return;
 		}
 		this.hub.abortRun();
-		await this.say(chatId, "⏹ 중단 요청 전송.");
+		await this.say(chatId, L("⏹ 중단 요청 전송.", "⏹ stop requested."));
 	}
 
 	private async deliver(chatId: number, args: string, mode: "steer" | "followUp"): Promise<void> {
 		const text = args.trim();
 		if (!text) {
-			await this.say(chatId, mode === "steer" ? `사용법: ${inlineCode("/steer 메시지")} — 실행 중인 에이전트에게 바로 지시` : `사용법: ${inlineCode("/queue 메시지")} — 실행이 끝난 뒤 전달`);
+			await this.say(chatId, (lang) =>
+				mode === "steer"
+					? `${pick(lang, "사용법", "usage")}: ${inlineCode("/steer 메시지")} — ${pick(lang, "실행 중인 에이전트에게 바로 지시", "tell the running agent right away")}`
+					: `${pick(lang, "사용법", "usage")}: ${inlineCode("/queue 메시지")} — ${pick(lang, "실행이 끝난 뒤 전달", "delivered once the run ends")}`,
+			);
 			return;
 		}
 		this.hub.noteTelegramInput(text);
 		this.hub.sendToPi(text, { deliverAs: mode });
-		await this.say(chatId, mode === "steer" ? "🧭 steer로 큐에 넣었어요." : "📮 follow-up으로 큐에 넣었어요.");
+		await this.say(chatId, (lang) => (mode === "steer" ? pick(lang, "🧭 steer로 큐에 넣었어요.", "🧭 queued as a steer.") : pick(lang, "📮 follow-up으로 큐에 넣었어요.", "📮 queued as a follow-up.")));
 	}
 
 	private async bash(chatId: number, args: string): Promise<void> {
 		const command = args.trim();
 		if (!command) {
-			await this.say(chatId, `사용법: ${inlineCode("/bash <command>")}`);
+			await this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/bash <command>")}`);
 			return;
 		}
 		await this.say(chatId, `💻 ${inlineCode(truncate(command, 200))}`);
@@ -426,7 +455,7 @@ export class CommandLayer {
 	private async exportSession(chatId: number): Promise<void> {
 		const path = this.hub.sessionFilePath();
 		if (!path) {
-			await this.say(chatId, "⚠️ 아직 파일로 저장되지 않은 세션이에요.");
+			await this.say(chatId, L("⚠️ 아직 파일로 저장되지 않은 세션이에요.", "⚠️ this session has not been saved to a file yet."));
 			return;
 		}
 		try {
@@ -435,10 +464,10 @@ export class CommandLayer {
 			const name = path.split(/[\\/]/).pop() ?? "session.jsonl";
 			// The transcript is a second copy of everything pi handled, tool output included.
 			const hits = credentialHits(Buffer.from(data).toString("utf8"));
-			const caption = `📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}${hits ? ` · ⚠️ credential처럼 보이는 문자열 ${hits}개` : ""}`;
+			const caption: Localized = (lang) => `📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}${hits ? ` · ⚠️ ${pick(lang, "credential처럼 보이는 문자열", "strings that look like credentials")} ${hits}` : ""}`;
 			await this.hub.sendFile(chatId, data, name, caption);
 		} catch (error) {
-			await this.say(chatId, `⚠️ export 실패: ${escapeHtml(safeError(error))}`);
+			await this.say(chatId, (lang) => `⚠️ export ${pick(lang, "실패", "failed")}: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
@@ -448,14 +477,16 @@ export class CommandLayer {
 		if (raw) {
 			const level = map[raw];
 			if (level == null) {
-				await this.say(chatId, `사용법: ${inlineCode("/verbose 0|1|2")}\n0 답장만 · 1 답장+도구 게시판 · 2 전체 미러링(thinking·결과 원문)`);
+				await this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/verbose 0|1|2")}\n0 ${pick(lang, "답장만", "answers only")} · 1 ${pick(lang, "답장+도구 게시판", "answers + live tool board")} · 2 ${pick(lang, "전체 미러링(thinking·결과 원문)", "full mirror (thinking · raw results)")}`);
 				return;
 			}
 			this.hub.cfg.verbosity = level;
 			this.hub.save();
 		}
-		const labels = ["답장만 (answers only)", "답장 + 도구 게시판 (default)", "전체 미러링 (full mirror)"];
-		await this.say(chatId, `🔍 detail ${this.hub.verbosity()} — ${labels[this.hub.verbosity()]}`);
+		await this.say(chatId, (lang) => {
+			const labels = [pick(lang, "답장만", "answers only"), pick(lang, "답장 + 도구 게시판", "answers + live tool board"), pick(lang, "전체 미러링", "full mirror")];
+			return `🔍 detail ${this.hub.verbosity()} — ${labels[this.hub.verbosity()] ?? ""}${this.hub.verbosity() === 1 ? ` · ${pick(lang, "기본값", "default")}` : ""}`;
+		});
 	}
 
 	private async stream(chatId: number, args: string): Promise<void> {
@@ -464,7 +495,7 @@ export class CommandLayer {
 			this.hub.cfg.streaming = raw === "on";
 			this.hub.save();
 		}
-		await this.say(chatId, `✍️ 실시간 초안 ${this.hub.cfg.streaming ? "on" : "off"}`);
+		await this.say(chatId, (lang) => `✍️ ${pick(lang, "실시간 초안", "live drafts")} ${this.hub.cfg.streaming ? "on" : "off"}`);
 	}
 
 	/**
@@ -474,24 +505,29 @@ export class CommandLayer {
 	private async activity(chatId: number, args: string): Promise<void> {
 		const raw = args.trim().toLowerCase();
 		const detail = this.hub.verbosity();
-		const elsewhere = detail === 1 ? "" : `<i>지금은 상세 ${inlineCode(String(detail))}이라 이 게시판은 안 보여요 — 상세 1에서 동작해요.</i>`;
 		if (raw === "on" || raw === "off") {
 			this.hub.cfg.activityLive = raw === "on";
 			this.hub.save();
-			const mode = this.hub.cfg.activityLive
-				? `🔧 도구 게시판 on — 한 턴이 메시지 하나로 끝나고, 도구가 진행되는 동안 그 메시지가 업데이트돼요.`
-				: `🔧 도구 게시판 off — 턴이 끝난 뒤 요약 메시지 하나만 보내요.`;
-			await this.say(chatId, [mode, elsewhere].filter(Boolean).join("\n"));
+			const mode = this.hub.cfg.activityLive ? true : false;
+			void mode;
+			await this.say(chatId, (lang) => {
+				const elsewhere = detail === 1 ? "" : `\n<i>${pick(lang, `지금은 상세 ${inlineCode(String(detail))}이라 이 게시판은 안 보여요 — 상세 1에서 동작해요.`, `at detail ${inlineCode(String(detail))} there is no board — it lives at detail 1.`)}</i>`;
+				const mode = this.hub.cfg.activityLive
+					? pick(lang, "🔧 도구 게시판 on — 한 턴이 메시지 하나로 끝나고, 도구가 진행되는 동안 그 메시지가 업데이트돼요.", "🔧 tool board on — one message per turn, edited while the tools run.")
+					: pick(lang, "🔧 도구 게시판 off — 턴이 끝난 뒤 요약 메시지 하나만 보내요.", "🔧 tool board off — one summary after the turn ends.");
+				return mode + elsewhere;
+			});
 			return;
 		}
 		await this.say(
 			chatId,
-			[
-				`🔧 도구 게시판: <b>${this.hub.cfg.activityLive ? "실시간 업데이트" : "턴 끝에 요약만"}</b> · 현재 상세 ${inlineCode(String(detail))}`,
-				detail === 1
-					? `<i>전환: ${inlineCode("/tg activity on|off")} · 상세 설정: ${inlineCode("/verbose 0|1|2")}</i>`
-					: `<i>이 설정은 상세 ${inlineCode("1")}에서만 동작해요 — 지금 상세에서는 영향이 없어요.</i> · 상세 설정: ${inlineCode("/verbose 0|1|2")}`,
-			].join("\n"),
+			joinLines([
+				(lang) => `🔧 ${pick(lang, "도구 게시판", "tool board")}: <b>${this.hub.cfg.activityLive ? pick(lang, "실시간 업데이트", "updated live") : pick(lang, "턴 끝에 요약만", "summarised at turn end")}</b> · ${pick(lang, "현재 상세", "current detail")} ${inlineCode(String(detail))}`,
+				(lang) =>
+					detail === 1
+						? `<i>${pick(lang, "전환", "toggle")}: ${inlineCode("/tg activity on|off")} · ${pick(lang, "상세 설정", "detail level")}: ${inlineCode("/verbose 0|1|2")}</i>`
+						: `<i>${pick(lang, `이 설정은 상세 ${inlineCode("1")}에서만 동작해요 — 지금 상세에서는 영향이 없어요.`, `this setting only applies at detail ${inlineCode("1")} — it changes nothing at your detail level.`)}</i> · ${pick(lang, "상세 설정", "detail level")}: ${inlineCode("/verbose 0|1|2")}`,
+			]),
 		);
 	}
 
@@ -560,32 +596,31 @@ export class CommandLayer {
 			else this.hub.cfg.redactTranscript = value;
 			this.hub.save();
 		} else if (flag) {
-			await this.say(chatId, `⚠️ usage: ${inlineCode("/tg redact on|off")} 또는 ${inlineCode("/tg redact transcript on|off")}`);
+			await this.say(chatId, (lang) => `⚠️ usage: ${inlineCode("/tg redact on|off")} ${pick(lang, "또는", "or")} ${inlineCode("/tg redact transcript on|off")}`);
 			return;
 		}
 		await this.say(
 			chatId,
-			[
-				"<b>credential 지우기</b>",
-				`· /bash 로그: ${this.hub.cfg.redactBash ? "on" : "off"}`,
-				`· 미러링되는 transcript: ${this.hub.cfg.redactTranscript ? "on" : "off"}`,
-				"",
-				"<i>pi/provider 에러와 브리지 알림은 항상 지워요 — provider가 요청에 쓰인 key를 에러문에 그대로 옮겨 적기 때문이에요. 보낸 key는 지워지지만 메지시 본문은 그대로 남아요.</i>",
+			joinLines([
+				(lang) => `<b>${pick(lang, "credential 지우기", "credential scrubbing")}</b>`,
+				(lang) => `· /bash ${pick(lang, "로그", "log")}: ${this.hub.cfg.redactBash ? "on" : "off"}`,
+				(lang) => `· ${pick(lang, "미러링되는 transcript", "mirrored transcript")}: ${this.hub.cfg.redactTranscript ? "on" : "off"}`,
+				(lang) => `<i>${pick(lang, "pi/provider 에러와 브리지 알림은 항상 지워요 — provider가 요청에 쓰인 key를 에러문에 그대로 옮겨 적기 때문이에요. 보낸 key는 지워지지만 메시지 본문은 그대로 남아요.", "pi and provider errors and every bridge notice are always scrubbed — a provider copies the key used for the request straight into its error text. The key that was sent gets removed; message bodies are left alone.")}</i>`,
 				`usage: ${inlineCode("/tg redact on|off")} · ${inlineCode("/tg redact transcript on|off")}`,
-			].join("\n"),
+			]),
 			{ markdown: false },
 		);
 	}
 
 	private async reload(chatId: number): Promise<void> {
-		await this.say(chatId, "♻️ pi 리소스 reload 중…");
+		await this.say(chatId, L("♻️ pi 리소스 reload 중…", "♻️ reloading pi resources…"));
 		try {
 			await this.hub.withCommandContext(async (ctx) => {
 				await ctx.reload();
 			});
-			await this.say(chatId, "✅ reload 완료 (브지도 다시 시작됩니다)");
+			await this.say(chatId, L("✅ reload 완료 (브지도 다시 시작됩니다)", "✅ reload done (the bridge restarts with it)"));
 		} catch (error) {
-			await this.say(chatId, `⚠️ reload 실패: ${escapeHtml(safeError(error))}`);
+			await this.say(chatId, (lang) => `⚠️ reload ${pick(lang, "실패", "failed")}: ${escapeHtml(safeError(error))}`);
 		}
 	}
 
@@ -599,19 +634,19 @@ export class CommandLayer {
 				return this.status(chatId);
 			case "pair":
 				this.hub.pairThisChat(chatId);
-				return this.say(chatId, "🔗 이 채팅을 허용 목록에 넣었어요.");
+				return this.say(chatId, L("🔗 이 채팅을 허용 목록에 넣었어요.", "🔗 this chat is on the allow list now."));
 			case "unpair":
 			case "leave":
-				return this.say(chatId, this.hub.unpairChat(chatId) ? "🔌 허용 목록에서 뺐어요. pi에서 /telegram-pair 로 다시 허용할 수 있어요." : "⚠️ 이미 허용 목록에 없어요.");
+				return this.say(chatId, this.hub.unpairChat(chatId) ? L("🔌 허용 목록에서 뺐어요. pi에서 /telegram-pair 로 다시 허용할 수 있어요.", "🔌 removed from the allow list. /telegram-pair in pi can let it back in.") : L("⚠️ 이미 허용 목록에 없어요.", "⚠️ that chat was never on the allow list."));
 			case "chats":
 				return this.chats(chatId);
 			case "pending": {
 				const pending = this.hub.pendingChats();
-				return this.say(chatId, pending.length ? `<b>pending</b>\n${pending.map((entry) => `${escapeHtml(entry.label)} → ${inlineCode(entry.code)}`).join("\n")}\npi 터미널에서 ${inlineCode("/telegram-pair <code>")}` : "pending 채팅 없음.");
+				return this.say(chatId, (lang) => (pending.length ? `<b>pending</b>\n${pending.map((entry) => `${escapeHtml(entry.label)} → ${inlineCode(entry.code)}`).join(String.fromCharCode(10))}\n${pick(lang, "pi 터미널에서", "in the pi terminal")} ${inlineCode("/telegram-pair <code>")}` : pick(lang, "pending 채팅 없음.", "no chats waiting for pairing.")));
 			}
 			case "restart":
 				this.hub.restartBridge();
-				return this.say(chatId, "🔁 브리지 재시작했어요.");
+				return this.say(chatId, L("🔁 브리지 재시작했어요.", "🔁 restarting the bridge."));
 			case "verbose":
 				return this.verbose(chatId, rest);
 			case "stream":
@@ -634,49 +669,49 @@ export class CommandLayer {
 				return this.say(chatId, goalCardHtml(state.goal, state.focus));
 			}
 			default:
-				return this.say(chatId, `사용법: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal")}`);
+				return this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/tg status|pair|unpair|chats|pending|restart|verbose|stream|activity|lang|stats|menu|redact|goal")}`);
 		}
 	}
 
 	/** Where the wait lives: pi thinking, or telegram round-trips. Numbers the user can read on a phone. */
 	private async tgStats(chatId: number): Promise<void> {
 		const stats = this.hub.bridgeStats();
-		const lines = [
-			`📊 <b>지연 통계</b> · 연결 후 ${formatDuration(stats.uptimeMs)}`,
-			`전송 호출 ${stats.calls}회 · 평균 ${stats.avgMs}ms · 최고 ${stats.maxMs}ms`,
-			`폴링 ${stats.polls.count}회 (평균 ${stats.polls.avgHoldMs}ms 대기 — 이건 지연이 아니에요)`,
-			`프롬프트 → pi 실행 시작: ${stats.promptToRunMs.length ? stats.promptToRunMs.map((ms) => `${ms}ms`).join(" · ") : "기록 없음"}`,
+		const parts: Localized[] = [
+			(lang) => `📊 <b>${pick(lang, "지연 통계", "latency report")}</b> · ${pick(lang, "연결 후", "connected for")} ${formatDuration(stats.uptimeMs)}`,
+			(lang) => `${pick(lang, "전송", "sends")} ${stats.calls}${pick(lang, "회", "")} · ${pick(lang, "평균", "avg")} ${stats.avgMs}ms · ${pick(lang, "최고", "max")} ${stats.maxMs}ms`,
+			(lang) => `${pick(lang, "폴링", "polling")} ${stats.polls.count}${pick(lang, "회", "")} (${pick(lang, "평균", "avg")} ${stats.polls.avgHoldMs}ms ${pick(lang, "대기 — 이건 지연이 아니에요", "held open — that is not delay")})`,
+			(lang) => `${pick(lang, "프롬프트 → pi 실행 시작", "prompt → pi started")}: ${stats.promptToRunMs.length ? stats.promptToRunMs.map((ms) => `${ms}ms`).join(" · ") : pick(lang, "기록 없음", "nothing recorded")}`,
 		];
-		if (stats.slow.length) lines.push(`느린 호출: ${stats.slow.map((call) => `${escapeHtml(call.method)} ${call.ms}ms`).join(" · ")}`);
+		if (stats.slow.length) parts.push((lang) => `${pick(lang, "느린 호출", "slow calls")}: ${stats.slow.map((call) => `${escapeHtml(call.method)} ${call.ms}ms`).join(" · ")}`);
 		if (stats.throttled.length) {
 			const worst = Math.max(...stats.throttled.map((entry) => entry.retryAfter));
-			lines.push(`telegram 속도 제한 ${stats.throttled.length}회 (최장 ${worst}s 대기)`);
+			parts.push((lang) => `telegram ${pick(lang, "속도 제한", "rate limits")} ${stats.throttled.length}${pick(lang, "회", "")} (${pick(lang, `최장 ${worst}s 대기`, `waited up to ${worst}s`)})`);
 		}
-		if (stats.menu.shadowed) lines.push(`⚠️ 자동완성 메뉴가 다른 프로그램에 의해 덮어써짐 (등록 ${stats.menu.registered} / 노출 ${stats.menu.served}) → /tg menu`);
-		if (stats.avgMs > 1200) lines.push(`<i>전송 왕복이 느려요 — 프록시/네트워크를 확인하세요 (TELEGRAM_API_ROOT로 우회 가능).</i>`);
-		return this.say(chatId, lines.join("\n"));
+		if (stats.menu.shadowed) parts.push((lang) => `⚠️ ${pick(lang, "자동완성 메뉴가 다른 프로그램에 의해 덮어써짐", "the autocomplete menu is shadowed by another program")} (${pick(lang, "등록", "registered")} ${stats.menu.registered} / ${pick(lang, "노출", "served")} ${stats.menu.served}) → /tg menu`);
+		if (stats.avgMs > 1200) parts.push(L("<i>전송 왕복이 느려요 — 프록시/네트워크를 확인하세요 (TELEGRAM_API_ROOT로 우회 가능).</i>", "<i>the send round-trip is slow — check the proxy and the network (TELEGRAM_API_ROOT can route around it).</i>"));
+		return this.say(chatId, joinLines(parts));
 	}
 
 	/** Re-register the "/" menu and say what telegram actually serves — autocomplete lies otherwise. */
 	private async tgMenu(chatId: number): Promise<void> {
 		const menu = await this.hub.refreshMenu();
-		if (!menu.registered) return this.say(chatId, "⚠️ <i>브리지 연결이 끊겨서 메뉴를 등록할 수 없어요. /restart </i>");
+		if (!menu.registered) return this.say(chatId, L("⚠️ <i>브리지 연결이 끊겨서 메뉴를 등록할 수 없어요. /restart </i>", "⚠️ <i>the bridge is disconnected, so no menu can be registered. /restart</i>"));
 		const ours = TELEGRAM_MENU.map((entry) => entry.command);
 		const foreign = menu.served.filter((name) => !ours.includes(name));
-		const lines = [
-			`✅ <b>자동완성 메뉴 등록 완료</b> · ${menu.registered}개 등록 / 텔레그램이 노출 중 ${menu.served}개`,
+		const parts: Localized[] = [
+			(lang) => `✅ <b>${pick(lang, "자동완성 메뉴 등록 완료", "autocomplete menu registered")}</b> · ${pick(lang, `${menu.registered}개 등록`, `${menu.registered} registered`)} · ${pick(lang, `텔레그램이 노출 중 ${menu.served}개`, `telegram shows ${menu.served}`)}`,
 			menu.shadowed
-				? `⚠️ 우리 명령이 목록에 없어요 — 같은 봇 토큰을 쓰는 다른 pi/브리지 프로세스가 있습니다. 그 프로세스를 끈 뒤 /restart 하세요.`
-				: `<i>목록이 정상입니다. 자동완성이 갱신되지 않으면 채팅을 다시 여세요.</i>`,
+				? L("⚠️ 우리 명령이 목록에 없어요 — 같은 봇 토큰을 쓰는 다른 pi/브리지 프로세스가 있습니다. 그 프로세스를 끈 뒤 /restart 하세요.", "⚠️ our commands are not in that list — another pi/bridge process is using the same bot token. Stop it, then /restart.")
+			: L("<i>목록이 정상입니다. 자동완성이 갱신되지 않으면 채팅을 다시 여세요.</i>", "<i>the list looks right. If autocomplete has not refreshed, close and reopen the chat.</i>"),
 		];
-		if (foreign.length) lines.push(`다른 목록에서 온 명령 ${foreign.length}개: ${foreign.slice(0, 12).map((name) => inlineCode(name)).join(" ")}`);
-		lines.push(`<i>메뉴에 없어도 명령은 그대로 쳐면 동작해요. 전체 목록은 /help</i>`);
-		return this.say(chatId, lines.join("\n"));
+		if (foreign.length) parts.push((lang) => `${pick(lang, `다른 목록에서 온 명령 ${foreign.length}개`, `${foreign.length} commands from someone else`)}: ${foreign.slice(0, 12).map((name) => inlineCode(name)).join(" ")}`);
+		parts.push(L("<i>메뉴에 없어도 명령은 그대로 쳐면 동작해요. 전체 목록은 /help</i>", "<i>a command missing from the menu still works when typed. /help lists everything.</i>"));
+		return this.say(chatId, joinLines(parts));
 	}
 
 	private async pair(chatId: number): Promise<void> {
 		this.hub.pairThisChat(chatId);
-		await this.say(chatId, "🔗 허용했어요. 이제 텍스트는 그대로 pi 프롬프트가 됩니다.");
+		await this.say(chatId, L("🔗 허용했어요. 이제 텍스트는 그대로 pi 프롬프트가 됩니다.", "🔗 paired. Your text is a pi prompt from here on."));
 	}
 
 	private async chats(chatId: number): Promise<void> {
@@ -701,17 +736,17 @@ export class CommandLayer {
 			const invocation = `/${target.name}${rest ? ` ${rest}` : ""}`;
 			this.hub.noteTelegramInput(invocation);
 			this.hub.sendToPi(invocation, { expandPromptTemplates: true });
-			await this.say(chatId, `▶️ ${inlineCode(`/${target.name}`)} 실행 (${target.source}).`);
+			await this.say(chatId, `▶️ ${inlineCode(`/${target.name}`)} · ${target.source}`);
 			return;
 		}
 		if (TERMINAL_ONLY.includes(name)) {
-			await this.say(chatId, `ℹ️ /${name} 은 pi 터미널 전용이에요. Telegram에서는 ${inlineCode("/model /thinking /compact /new /resume /fork /tree /rename /reload /bash /usage")} 를 쓸 수 있어요.`);
+			await this.say(chatId, (lang) => `ℹ️ /${name} ${pick(lang, "은 pi 터미널 전용이에요.", "is pi-terminal only.")} ${pick(lang, "Telegram에서는", "On Telegram you can use")} ${inlineCode("/model /thinking /compact /new /resume /fork /tree /rename /reload /bash /usage")}.`);
 			return;
 		}
 		const invocation = inv.raw.trim();
 		this.hub.noteTelegramInput(invocation);
 		this.hub.sendToPi(invocation, { expandPromptTemplates: true });
-		await this.say(chatId, `❓ 알려진 명령이 아니어서 pi에 그대로 보냈어요. 프롬프트 템플릿/스킬이면 동작합니다. 목록: ${inlineCode("/commands")}`);
+		await this.say(chatId, (lang) => `❓ ${pick(lang, "알려진 명령이 아니어서 pi에 그대로 보냈어요. 프롬프트 템플릿·스킬이면 동작해요.", "not a known command, so it went to pi as written — a prompt template or skill will still run it.")} ${pick(lang, "목록", "list")}: ${inlineCode("/commands")}`);
 	}
 
 	// ------------------------------------------------------------------ lists
@@ -722,8 +757,8 @@ export class CommandLayer {
 				const models = spec.args.trim() ? this.hub.searchModels(spec.args, 80) : this.hub.listModels();
 				const local = models.filter((model) => model.local).length;
 				return {
-					title: `<b>model</b> · ${models.length}${spec.args ? ` "${escapeHtml(spec.args.trim())}"${models.length >= 80 ? ` ✂️ 일부만` : ""}` : " available"}${local ? ` · ${local} local 🏠` : ""}`,
-					note: `🏠 = 내 머신 · 🔑 = pi에 이 provider의 인증이 없어요${this.hub.modelProviders().reduce((sum, entry) => sum + entry.count, 0) > models.length + 10 ? ` · 🔎 pi가 아는 모델은 ${this.hub.modelProviders().reduce((sum, entry) => sum + entry.count, 0)}개 — ${inlineCode("/model <검색어>")}나 ${inlineCode("provider/id")}로 직접 지정` : ""}`,
+					title: (lang) => `<b>model</b> · ${models.length}${spec.args ? ` "${escapeHtml(spec.args.trim())}"${models.length >= 80 ? ` ✂️ ${pick(lang, "일부만", "partial")}` : ""}` : ` ${pick(lang, "관련", "matching")}`}${local ? ` · ${pick(lang, `${local}개 로컬`, `${local} local`)} 🏠` : ""}`,
+					note: (lang) => `🏠 = ${pick(lang, "내 머신", "my machine")} · 🔑 = ${pick(lang, "pi에 이 provider의 인증이 없어요", "pi has no credential for this provider")}${this.hub.modelProviders().reduce((sum, entry) => sum + entry.count, 0) > models.length + 10 ? ` · 🔎 ${pick(lang, `pi가 아는 모델은 ${this.hub.modelProviders().reduce((sum, entry) => sum + entry.count, 0)}개 — ${inlineCode("/model <검색어>")}나 ${inlineCode("provider/id")}로 직접 지정`, `pi knows ${this.hub.modelProviders().reduce((sum, entry) => sum + entry.count, 0)} models — name one with ${inlineCode("/model <search>")} or ${inlineCode("provider/id")}`)}` : ""}`,
 					perPage: 12,
 					columns: 1,
 					items: models.map((model) => ({
@@ -736,12 +771,12 @@ export class CommandLayer {
 			case "model:providers": {
 				const providers = this.hub.modelProviders();
 				return {
-					title: `<b>model</b> 🗂 · ${providers.reduce((sum, entry) => sum + entry.count, 0)}개 · provider를 고르세요`,
-					note: `${inlineCode("/model <검색어>")}나 ${inlineCode("/model <provider/id>")}를 직접 입력해도 돼요`,
+					title: (lang) => `<b>model</b> 🗂 · ${providers.reduce((sum, entry) => sum + entry.count, 0)} · ${pick(lang, "provider를 고르세요", "pick a provider")}`,
+					note: (lang) => pick(lang, `${inlineCode("/model <검색어>")} · ${inlineCode("/model <provider/id>")}`, `${inlineCode("/model <search>")} or ${inlineCode("/model <provider/id>")} also work typed directly`),
 					perPage: 12,
 					columns: 1,
 					items: providers.map((entry) => ({
-						label: clip(`${entry.local ? "🏠 " : ""}${entry.needsAuth ? "🔑 " : ""}${clip(entry.provider, 28)} · ${entry.count}개`, 62),
+						label: clip(`${entry.local ? "🏠 " : ""}${entry.needsAuth ? "🔑 " : ""}${clip(entry.provider, 28)} · ${entry.count}`, 62),
 						kind: "model:provider" as CallbackActionKind,
 						value: entry.provider,
 					})),
@@ -752,7 +787,7 @@ export class CommandLayer {
 				const query = spec.args.trim().toLowerCase();
 				const filtered = query ? sessions.filter((entry) => entry.label.toLowerCase().includes(query) || (entry.projectLabel ?? "").toLowerCase().includes(query)) : sessions;
 				return {
-					title: `<b>resume</b> · ${filtered.length} sessions (최신순 · 지금 프로젝트 먼저)`,
+					title: (lang) => `<b>resume</b> · ${filtered.length} ${pick(lang, "세션 (최신순 · 이 프로젝트 먼저)", "sessions (newest first · this project first)")}`,
 					perPage: 8,
 					columns: 1,
 					items: filtered.map((entry) => ({
@@ -767,20 +802,20 @@ export class CommandLayer {
 				const query = spec.args.trim().toLowerCase();
 				const filtered = query ? prompts.filter((entry) => entry.text.toLowerCase().includes(query)) : prompts;
 				return {
-					title: `<b>fork</b> · 지점을 선택하세요`,
+					title: (lang) => `<b>fork</b> · ${pick(lang, "지점을 선택하세요", "pick a starting point")}`,
 					perPage: 8,
 					columns: 1,
-					note: "선택하면 그 프롬프트 시점부터 새 세션이 시작돼요.",
+					note: L("선택하면 그 프롬프트 시점부터 새 세션이 시작돼요.", "picking one starts a new session from that prompt"),
 					items: filtered.map((entry) => ({ label: `↪ ${clip(entry.text, 56)}`, kind: "fork:pick" as CallbackActionKind, value: entry.entryId })),
 				};
 			}
 			case "tree": {
 				const entries = this.hub.listTreeEntries(60);
 				return {
-					title: `<b>tree</b> · 이동할 지점 선택`,
+					title: (lang) => `<b>tree</b> · ${pick(lang, "이동할 지점", "where to jump to")}`,
 					perPage: 8,
 					columns: 1,
-					note: "요약 없이 해당 지점으로 이동합니다.",
+					note: L("요약 없이 해당 지점으로 이동합니다.", "moves to that point without summarising"),
 					items: entries.map((entry) => ({ label: `${entry.current ? "● " : "  "}${clip(entry.label, 56)}`, kind: "tree:pick" as CallbackActionKind, value: entry.entryId })),
 				};
 			}
@@ -814,7 +849,7 @@ export class CommandLayer {
 				const tools = this.hub.listTools();
 				return {
 					title: `<b>tools</b> · ${tools.filter((tool) => tool.active).length}/${tools.length} active`,
-					note: "누르면 바로 적용돼요.",
+					note: L("누르면 바로 적용돼요.", "a tap applies it right away"),
 					perPage: 16,
 					columns: 2,
 					items: tools.map((tool) => ({ label: `${tool.active ? "✅" : "⬜"} ${clip(tool.name, 20)}`, kind: "tools:toggle" as CallbackActionKind, value: tool.name })),
@@ -824,18 +859,18 @@ export class CommandLayer {
 	}
 
 	private async renderList(chatId: number, spec: ListSpec, editMessageId?: number): Promise<void> {
-		const render = this.listRender(spec);
-		if (!render.items.length) {
-			await this.say(chatId, `⚠️ 항목이 없어요${spec.args ? `: ${inlineCode(spec.args)}` : ""}`);
+		const view = this.listRender(spec);
+		if (!view.items.length) {
+			await this.say(chatId, (lang) => `⚠️ ${pick(lang, "항목이 없어요", "nothing to show")}${spec.args ? `: ${inlineCode(spec.args)}` : ""}`);
 			return;
 		}
-		const pages = Math.max(1, Math.ceil(render.items.length / render.perPage));
+		const pages = Math.max(1, Math.ceil(view.items.length / view.perPage));
 		const page = Math.min(spec.page, pages - 1);
-		const slice = render.items.slice(page * render.perPage, (page + 1) * render.perPage);
+		const slice = view.items.slice(page * view.perPage, (page + 1) * view.perPage);
 		const rows: TgInlineKeyboardButton[][] = [];
-		for (let index = 0; index < slice.length; index += render.columns) {
+		for (let index = 0; index < slice.length; index += view.columns) {
 			rows.push(
-				slice.slice(index, index + render.columns).map((item) => ({
+				slice.slice(index, index + view.columns).map((item) => ({
 					text: item.label,
 					callback_data: this.hub.createToken({ kind: item.kind, value: item.value }, chatId),
 				})),
@@ -848,9 +883,12 @@ export class CommandLayer {
 			if (page < pages - 1) nav.push({ text: "▶️", callback_data: this.hub.createToken({ kind: "list:page", blob: { ...spec, page: page + 1 } }, chatId) });
 			rows.push(nav);
 		}
-		const text = `${render.title}\n${render.note ? `<i>${render.note}</i>\n` : ""}`;
+		const text: Localized = (lang) => {
+			const note = render(view.note ?? "", lang);
+			return `${render(view.title, lang)}\n${note ? `<i>${note}</i>\n` : ""}`;
+		};
 		if (editMessageId) {
-			const ok = await this.hub.editKeyboard(chatId, editMessageId, text, rows);
+			const ok = await this.hub.editKeyboard(chatId, editMessageId, render(text, this.hub.lang(chatId)), rows);
 			if (!ok) await this.say(chatId, text, { keyboard: rows });
 			return;
 		}
@@ -872,41 +910,41 @@ export class CommandLayer {
 				return { toast: action.value ?? "" };
 			case "thinking:pick": {
 				const result = this.hub.setThinkingLevel(action.value ?? "off");
-				return { toast: result.ok ? `thinking: ${action.value}` : "변경 실패", showAlert: !result.ok };
+				return { toast: result.ok ? `thinking: ${action.value}` : pick(this.hub.lang(chatId), "변경 실패", "change failed"), showAlert: !result.ok };
 			}
 			case "resume:pick": {
-				if (!action.value) return { toast: "세션을 찾을 수 없어요", showAlert: true };
-				await this.say(chatId, "♻️ 세션 불러오는 중…");
-				const notice = this.hub.notifyAfterRestart(`♻️ <b>세션 전환</b> 완료 · ${inlineCode(this.hub.sessionInfo().id)}`);
+				if (!action.value) return { toast: pick(this.hub.lang(chatId), "세션을 찾을 수 없어요", "that session is gone"), showAlert: true };
+				await this.say(chatId, L("♻️ 세션 불러오는 중…", "♻️ loading that session…"));
+				const notice = this.hub.notifyAfterRestart((lang) => `♻️ <b>${pick(lang, "세션 전환", "session switched")}</b> · ${inlineCode(this.hub.sessionInfo().id)}`);
 				try {
 					await this.hub.withCommandContext(async (ctx) => {
 						await ctx.switchSession(action.value!);
 					});
 					this.hub.clearPendingNotice(notice);
-					await this.say(chatId, "✅ 세션 전환 요청이 처리됐어요.");
+					await this.say(chatId, L("✅ 세션 전환 요청이 처리됐어요.", "✅ the session switch was handled."));
 				} catch (error) {
 					this.hub.clearPendingNotice(notice);
-					await this.quietSay(chatId, `⚠️ resume 실패: ${escapeHtml(safeError(error))}`);
+					await this.quietSay(chatId, (lang) => `⚠️ resume ${pick(lang, "실패", "failed")}: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "resumed" };
 			}
 			case "fork:pick": {
-				if (!action.value) return { toast: "항목을 찾을 수 없어요", showAlert: true };
-				const notice = this.hub.notifyAfterRestart(`🌱 <b>fork</b> 완료 — 그 지점부터 새 세션이 이어져요.`);
+				if (!action.value) return { toast: pick(this.hub.lang(chatId), "항목을 찾을 수 없어요", "that entry is gone"), showAlert: true };
+				const notice = this.hub.notifyAfterRestart(L("🌱 <b>fork</b> 완료 — 그 지점부터 새 세션이 이어져요.", "🌱 <b>fork</b> done — the session continues from that point."));
 				try {
 					await this.hub.withCommandContext(async (ctx) => {
 						await ctx.fork(action.value!, { position: "at" });
 					});
 					this.hub.clearPendingNotice(notice);
-					await this.say(chatId, "🌱 fork 완료 — 새 세션에서 이어가요.");
+					await this.say(chatId, L("🌱 fork 완료 — 새 세션에서 이어가요.", "🌱 fork done — a new session continues from there."));
 				} catch (error) {
 					this.hub.clearPendingNotice(notice);
-					await this.quietSay(chatId, `⚠️ fork 실패: ${escapeHtml(safeError(error))}`);
+					await this.quietSay(chatId, (lang) => `⚠️ fork ${pick(lang, "실패", "failed")}: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "forked" };
 			}
 			case "tree:pick": {
-				if (!action.value) return { toast: "항목을 찾을 수 없어요", showAlert: true };
+				if (!action.value) return { toast: pick(this.hub.lang(chatId), "항목을 찾을 수 없어요", "that entry is gone"), showAlert: true };
 				try {
 					tgDebug("tree:pick", action.value);
 					// Moving in the tree can make pi summarize branches, and pi refuses prompts while it does.
@@ -921,11 +959,11 @@ export class CommandLayer {
 						this.hub.setContextBusy(false, "tree navigation");
 					}
 					tgDebug("tree: context action done, confirming in chat");
-					await this.say(chatId, "🌳 이동 완료.");
+					await this.say(chatId, L("🌳 이동 완료.", "🌳 moved."));
 					tgDebug("tree: confirmation sent");
 				} catch (error) {
 					tgDebug("tree:pick failed", errorMessage(error));
-					await this.say(chatId, `⚠️ tree 이동 실패: ${escapeHtml(safeError(error))}`);
+					await this.quietSay(chatId, (lang) => `⚠️ tree ${pick(lang, "이동 실패", "move failed")}: ${escapeHtml(safeError(error))}`);
 				}
 				return { toast: "moved" };
 			}
@@ -943,14 +981,14 @@ export class CommandLayer {
 				return { toast: "default tools" };
 			}
 			case "commands:pick": {
-				if (!action.value) return { toast: "명령어를 찾을 수 없어요", showAlert: true };
+				if (!action.value) return { toast: pick(this.hub.lang(chatId), "명령어를 찾을 수 없어요", "that command is gone"), showAlert: true };
 				this.hub.noteTelegramInput(`/${action.value}`);
 				this.hub.sendToPi(`/${action.value}`, { expandPromptTemplates: true });
 				return { toast: `/${action.value}` };
 			}
 			case "list:page": {
 				const spec = action.blob as ListSpec;
-				if (!spec?.list) return { toast: "목록이 만료됐어요", showAlert: true };
+				if (!spec?.list) return { toast: pick(this.hub.lang(chatId), "목록이 만료됐어요", "this list has expired"), showAlert: true };
 				await this.renderList(chatId, spec, messageId);
 				return { toast: "" };
 			}
@@ -962,9 +1000,9 @@ export class CommandLayer {
 			}
 			case "chat:unpair": {
 				const target = Number(action.value ?? "");
-				if (!Number.isFinite(target)) return { toast: "잘못된 채팅 id", showAlert: true };
+				if (!Number.isFinite(target)) return { toast: pick(this.hub.lang(chatId), "잘못된 채팅 id", "bad chat id"), showAlert: true };
 				const removed = this.hub.unpairChat(target);
-				return { toast: removed ? `revoked ${target}` : "이미 없음", showAlert: !removed };
+				return { toast: removed ? `revoked ${target}` : pick(this.hub.lang(chatId), "이미 없음", "already gone"), showAlert: !removed };
 			}
 			case "noop":
 				return { toast: "" };
@@ -976,7 +1014,7 @@ export class CommandLayer {
 	// ----------------------------------------------------------------- layout
 
 	/** Reply, tolerating a bridge that already went away with a replaced pi session. */
-	private async quietSay(chatId: number, html: string): Promise<void> {
+	private async quietSay(chatId: number, html: Localized): Promise<void> {
 		try {
 			await this.say(chatId, html);
 		} catch {

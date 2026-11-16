@@ -137,6 +137,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tg restart` | — | Reconnect. |
 | `/tg verbose [0\|1\|2]` · `/tg stream [on\|off]` | | Same as the top-level commands. |
 | `/tg activity [on\|off]` | | At detail `1`, either keep one tool board live during the turn (default) or show only the summary when the turn ends. |
+| `/tg lang [ko\|en\|auto]` | | What language the bridge uses in this chat, why it chose that one, and how to change it. `auto` hands it back to what Telegram reports. |
 | `/tg stats` (alias `/tg latency`) | — | Telegram call count / average / max, poll count, slow calls, 429s, and prompt → run-start delay. Tells you whether a slow reply is pi thinking or the network. |
 | `/tg menu` | — | Re-register the “/” autocomplete menu and verify what Telegram serves. Use it when the autocomplete list looks wrong (see below). |
 | `/tg redact [on\|off]` · `/tg redact transcript [on\|off]` | | Control how much credential scrubbing the bridge applies to the copies it makes for Telegram (`/bash` output is scrubbed by default; the mirrored transcript is not). |
@@ -247,10 +248,11 @@ want the tool available at all — remove it from pi's tool list if you do not.
 | Key | Meaning |
 | --- | --- |
 | `token` | bot token (written by `/telegram-setup`, file mode `0600`) |
-| `chats` | paired chats `[{ chatId, label, name }]` |
+| `chats` | paired chats `[{ chatId, label, name }]` — each one also remembers a language (`lang` pinned by `/tg lang`, `tgLang` what Telegram reported) |
 | `verbosity` | `0` / `1` / `2` |
 | `streaming` | live draft editing while pi streams |
 | `activityLive` | at detail `1`, keep the turn's tool board updated during the turn (default `true`; `false` = summary at turn end only) |
+| `language` | pin the bridge's own language for every chat (`ko` / `en`). Left unset, each chat follows what Telegram reports — and an install that already has paired chats stays Korean |
 | `announce` | connect/disconnect notices |
 | `redactBash` | scrub credential-looking text out of `/bash` output the bridge copies to Telegram (default `true`) |
 | `redactTranscript` | also scrub the mirrored transcript (default `false` — detail mode should match the terminal) |
@@ -261,6 +263,14 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
 
 ## Behaviour worth knowing
 
+* **The bridge speaks the chat's language.** Telegram names the language of every client, and the bridge
+  remembers it per chat, so menus, buttons, cards, notices and the tool board come out in Korean or
+  English without anyone asking. `/tg lang ko|en` pins one chat, `language` in `telegram.json` pins them
+  all, and `/tg lang auto` gives the choice back to Telegram. An install whose chats were already paired
+  when this arrived keeps hearing Korean — a language should not change half way through somebody's
+  week — and a fresh install follows Telegram. What pi *answers* is never rewritten: the language of
+  your prompt and the model decide that, and `/model` can carry an instruction like "answer in Korean"
+  (`/resume` brings that back with the session).
 * **Compaction is visible.** pi blocks new prompts while it rebuilds its context, and it used to do
   that silently as far as Telegram was concerned. Now the bridge announces it — `🗜 컨텍스트 압축 중…`
   with the context size and what triggered it (`/compact`, the context threshold, or an overflow

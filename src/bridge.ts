@@ -16,7 +16,7 @@ import { escapeHtml, formatBytes, formatCount, redactSecrets, registerSecret, sc
 import type { CallbackAction, CallbackEntry, Hub, ModelLike, SendOptions, ShellResult, SessionInfoLike } from "./hub.ts";
 import { CALLBACK_PREFIX, stripCallbackPrefix } from "./hub.ts";
 import type { Lang, Localized } from "./i18n.ts";
-import { langFromTelegramCode, render } from "./i18n.ts";
+import { L, langFromTelegramCode, pick, render } from "./i18n.ts";
 import { OutboundMirror } from "./mirror.ts";
 import { listPromptEntries, listSessions } from "./session-index.ts";
 import type { SessionSummary } from "./session-index.ts";
@@ -262,7 +262,8 @@ export class TelegramBridge implements Hub {
 			if (!this.waitingOnTerminal || this.waitingOnTerminal !== waiting) return;
 			if (this.questions.openCount() > 0 || this.cfg.verbosity < 1) return;
 			void this.broadcast(
-				`⏸️ <i>pi가 터미널에서 답을 기다려요 (${escapeHtml(waiting.kind)}${waiting.title ? ` · ${escapeHtml(truncate(waiting.title, 80))}` : ""}) — 이 대화상자는 pi 앞에서 답해야 해요.</i>`,
+				(lang) =>
+					`⏸️ <i>${pick(lang, "pi가 터미널에서 답을 기다려요", "pi is waiting for an answer at the terminal")} (${escapeHtml(waiting.kind)}${waiting.title ? ` · ${escapeHtml(truncate(waiting.title, 80))}` : ""}) — ${pick(lang, "이 대화상자는 pi 앞에서 답해야 해요.", "this dialog has to be answered in front of pi.")}</i>`,
 				{ markdown: false },
 			).catch(() => undefined);
 		}, 1500);
@@ -392,7 +393,7 @@ export class TelegramBridge implements Hub {
 				}
 				this.approvePending(match);
 				this.notifyUi(ctx, `paired ${match.label} (${match.chatId})`, "info");
-				await this.sendHtml(match.chatId, "✅ pairing approved — 텍스트는 이제 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.").catch(() => undefined);
+				await this.sendHtml(match.chatId, L("✅ pairing approved — 텍스트는 이제 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.", "✅ pairing approved — your messages are pi prompts from here on.\n/help lists the commands.")).catch(() => undefined);
 			},
 		});
 
@@ -553,7 +554,10 @@ export class TelegramBridge implements Hub {
 			this.pollLoop = this.runPollLoop(this.pollAbort.signal);
 			this.refreshStatus();
 			if (this.cfg.announce) {
-				await this.broadcast(`🟢 <b>${escapeHtml(displayName(me))}</b> · pi 연결됨\n${this.cfg.chats.length} chat(s) · detail ${this.cfg.verbosity} · drafts ${this.cfg.streaming ? "on" : "off"}`, { markdown: false });
+				await this.broadcast(
+					(lang) => `🟢 <b>${escapeHtml(displayName(me))}</b> · ${pick(lang, "pi 연결됨", "connected to pi")}\n${this.cfg.chats.length} chat(s) · detail ${this.cfg.verbosity} · drafts ${this.cfg.streaming ? "on" : "off"}`,
+					{ markdown: false },
+				);
 			}
 			await this.flushPendingNotice();
 			this.notifyUi(this.eventCtx, `telegram bridge connected as ${displayName(me)}`, "info");
@@ -578,7 +582,7 @@ export class TelegramBridge implements Hub {
 		this.cfg.pendingNotice = undefined;
 		writeConfigNow(this.cfg);
 		if (Date.now() - notice.at > NOTICE_TTL_MS) return;
-		await this.broadcast(notice.text, { markdown: false, silent: true }).catch(() => undefined);
+		await this.broadcast((lang) => (lang === "en" ? notice.en : notice.ko), { markdown: false, silent: true }).catch(() => undefined);
 	}
 
 	async stop(reason?: string, silent = false): Promise<void> {
@@ -596,7 +600,7 @@ export class TelegramBridge implements Hub {
 		this.clearPromptWatch("bridge stopped");
 		this.clearTerminalDialog();
 		// A questionnaire belonged to this session; leave dead buttons in the chats and they invite taps.
-		this.questions.closeAll("pi 세션이 끝나면서 질문도 닫혔어요.");
+		this.questions.closeAll(L("pi 세션이 끝나면서 질문도 닫혔어요.", "the pi session ended, and the question closed with it."));
 		this.pollAbort?.abort();
 		const loop = this.pollLoop;
 		this.pollLoop = undefined;
@@ -635,9 +639,11 @@ export class TelegramBridge implements Hub {
 	 * /new, /resume and /fork dispose this pi session and re-create the extension, so the instance
 	 * running the action is gone by the time the action lands — the fresh instance sends this.
 	 */
-	notifyAfterRestart(text: string): number {
+	notifyAfterRestart(notice: Localized): number {
 		const at = Date.now();
-		this.cfg.pendingNotice = { text, at };
+		// Both languages are written now, while they can still be rendered: the instance that reads this
+		// file back knows which chat it is talking to, the one writing it did not.
+		this.cfg.pendingNotice = { ko: render(notice, "ko"), en: render(notice, "en"), at };
 		writeConfigNow(this.cfg);
 		return at;
 	}
@@ -795,19 +801,20 @@ export class TelegramBridge implements Hub {
 			const budget = this.inboundBudget.get(chatId);
 			if (!budget?.warnedAt || Date.now() - budget.warnedAt > 60_000) {
 				if (budget) budget.warnedAt = Date.now();
-				await this.sendHtml(chatId, `⏳ <i>너무 빨라요 — 잠시 후 다시 보내 주세요 (1분당 약 ${PAIRED_BUDGET.refillPerMin}개 처리).</i>`);
+				await this.sendHtml(chatId, (lang) => `⏳ <i>${pick(lang, "너무 빨라요 — 잠시 후 다시 보내 주세요", "too fast — send it again in a moment")} (${pick(lang, "1분당 약", "about")} ${PAIRED_BUDGET.refillPerMin}${pick(lang, "개 처리", "/min")}).</i>`);
 			}
 			return;
 		}
 		if (text.length > MAX_INBOUND_TEXT) {
 			await this.sendHtml(
 				chatId,
-				`⚠️ <i>지나치게 긴 메시지예요 (${text.length}자, 최대 ${MAX_INBOUND_TEXT}). 파일로 보내 주시면 전체를 읽을 수 있어요 — 예: /bash 로 읽히기.</i>`,
+				(lang) =>
+					`⚠️ <i>${pick(lang, "지나치게 긴 메시지예요", "that message is far too long")} (${text.length} ${pick(lang, "자, 최대", "chars, max")} ${MAX_INBOUND_TEXT}). ${pick(lang, "파일로 보내 주시면 전체를 읽을 수 있어요 — 예: /bash 로 읽히기.", "send it as a file and all of it can be read — e.g. read it with /bash.")}</i>`,
 			);
 			return;
 		}
 		if (edited) {
-			await this.sendHtml(chatId, "ℹ️ 편집된 메시지는 무시했어요. 처음부터 다시 보내 주세요.");
+			await this.sendHtml(chatId, L("ℹ️ 편집된 메시지는 무시했어요. 처음부터 다시 보내 주세요.", "ℹ️ edited messages are ignored — send it again from scratch."));
 			return;
 		}
 		if (!message.from && message.chat.type !== "channel") return;
@@ -820,7 +827,7 @@ export class TelegramBridge implements Hub {
 			try {
 				await this.commands.handle({ chatId, userId: message.from?.id ?? chatId, command, args, raw: text });
 			} catch (error) {
-				await this.sendHtml(chatId, `⚠️ /${escapeHtml(command)} 실패: ${escapeHtml(errorMessage(error))}`);
+				await this.sendHtml(chatId, (lang) => `⚠️ /${escapeHtml(command)} ${pick(lang, "실패", "failed")}: ${escapeHtml(errorMessage(error))}`);
 			}
 			return;
 		}
@@ -837,12 +844,12 @@ export class TelegramBridge implements Hub {
 		const codeMatch = CODE_RE.exec(text);
 		if (entry && entry.cooldownUntil && Date.now() < entry.cooldownUntil) {
 			const wait = Math.ceil((entry.cooldownUntil - Date.now()) / 1000);
-			await this.sendHtml(chatId, `⏳ <i>코드를 ${PAIR_MAX_ATTEMPTS}번 틀려서 일시 정지 — ${wait}초 후 새 코드로 다시 시도하세요. 운영자에게 알렸어요.</i>`);
+			await this.sendHtml(chatId, (lang) => `⏳ <i>${pick(lang, `코드를 ${PAIR_MAX_ATTEMPTS}번 틀려서 일시 정지`, `${PAIR_MAX_ATTEMPTS} wrong codes — this chat is cooling down`)} — ${pick(lang, `${wait}초 후 새 코드로 다시 시도하세요.`, `try the new code again in ${wait}s.`)} ${pick(lang, "운영자에게 알렸어요.", "the operator has been told.")}</i>`);
 			return;
 		}
 		if (entry && codeMatch && entry.code === codeMatch[1]) {
 			this.approvePending(entry);
-			await this.sendHtml(chatId, "✅ paired! 텍스트는 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.");
+			await this.sendHtml(chatId, L("✅ paired! 텍스트는 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.", "✅ paired! Your text goes straight to pi now.\n/help lists the commands."));
 			this.notifyUi(this.eventCtx, `telegram paired: ${label} (${chatId})`, "info");
 			return;
 		}
@@ -857,10 +864,10 @@ export class TelegramBridge implements Hub {
 					`telegram: ${label} (${chatId}) guessed pairing codes ${PAIR_MAX_ATTEMPTS} times — code rotated, chat on cooldown for ${PAIR_COOLDOWN_MS / 60_000} minutes`,
 					"warning",
 				);
-				await this.sendHtml(chatId, `⛔ <i>코드를 여러 번 틀렸어요. 코드가 바뀌었고 잠시 후 다시 시도할 수 있어요.</i>`);
+				await this.sendHtml(chatId, L(`⛔ <i>코드를 여러 번 틀렸어요. 코드가 바뀌었고 잠시 후 다시 시도할 수 있어요.</i>`, `⛔ <i>too many wrong codes. The code has changed, and you can try again shortly.</i>`));
 				return;
 			}
-			await this.sendHtml(chatId, `⛔ <i>그 코드가 아니에요 (${entry.attempts}/${PAIR_MAX_ATTEMPTS}). 운영자에게 코드를 다시 물어보세요.</i>`);
+			await this.sendHtml(chatId, (lang) => `⛔ <i>${pick(lang, "그 코드가 아니에요", "that is not the code")} (${entry.attempts}/${PAIR_MAX_ATTEMPTS}). ${pick(lang, "운영자에게 코드를 다시 물어보세요.", "ask the operator for the code again.")}</i>`);
 			return;
 		}
 		const fresh: PendingChat = entry ?? { chatId, code: randomCode(), label, createdAt: Date.now(), userId: message.from?.id };
@@ -869,7 +876,8 @@ export class TelegramBridge implements Hub {
 		this.prunePending();
 		await this.sendHtml(
 			chatId,
-			`🔒 <b>pairing 필요</b>\npi 운영자가 pi 터미널에서 확인해야 합니다:\n1. <code>/telegram-pair</code> → 대기 목록과 코드 확인\n2. pi에서 <code>/telegram-pair &lt;code&gt;</code> 실행\n\n또는 운영자가 보내준 ${PAIR_CODE_RANGE[0].toString().length}자리 코드를 여기에 입력하면 허용됩니다.`,
+			(lang) =>
+				`🔒 <b>${pick(lang, "pairing 필요", "pairing required")}</b>\n${pick(lang, "pi 운영자가 pi 터미널에서 확인해야 합니다:", "the pi operator has to confirm this in the pi terminal:")}\n1. <code>/telegram-pair</code> → ${pick(lang, "대기 목록과 코드 확인", "see the pending list and the code")}\n2. ${pick(lang, "pi에서", "in pi")} <code>/telegram-pair &lt;code&gt;</code>\n\n${pick(lang, `또는 운영자가 보내준 ${PAIR_CODE_RANGE[0].toString().length}자리 코드를 여기에 입력하면 허용됩니다.`, `or type the ${PAIR_CODE_RANGE[0].toString().length}-digit code the operator sends you here.`)}`,
 		);
 		this.notifyUi(this.eventCtx, `telegram pairing request: ${label} (${chatId}) → code ${fresh.code} (approve with /telegram-pair ${fresh.code})`, "info");
 	}
@@ -900,7 +908,10 @@ export class TelegramBridge implements Hub {
 		if (!body && !images.length) {
 			await this.sendHtml(
 				chatId,
-				"ℹ️ 텍스트나 이미지를 보내 주세요 — 코드·텍스트 파일도 첨부로 열어요.\n· PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요 · 명령어 목록은 /help",
+				L(
+					"ℹ️ 텍스트나 이미지를 보내 주세요 — 코드·텍스트 파일도 첨부로 열어요.\n· PDF·엑셀 같은 파일은 컴퓨터에 저장한 뒤 경로를 말해 주세요 · 명령어 목록은 /help",
+					"ℹ️ send text or an image — code and text files come through as attachments.\n· for PDFs, spreadsheets and the like, keep the file on the machine and tell me its path · /help lists the commands",
+				),
 			);
 			return;
 		}
@@ -912,7 +923,8 @@ export class TelegramBridge implements Hub {
 			this.heldPrompts.push({ chatId, text: body, content });
 			await this.sendHtml(
 				chatId,
-				`⏳ <i>지금 컨텍스트를 압축/요약 중이에요. 이 메시지는 그다음에 pi에 전달될 거예요 (대기 ${this.heldPrompts.length}개).</i>`,
+				(lang) =>
+					`⏳ <i>${pick(lang, "지금 컨텍스트를 압축/요약 중이에요. 이 메시지는 그다음에 pi에 전달될 거예요", "pi is compacting its context right now — this message reaches pi afterwards")} (${pick(lang, "대기", "queued")} ${this.heldPrompts.length}).</i>`,
 			);
 			this.dbg("prompt held for compaction", chatId, body.slice(0, 40));
 			return;
@@ -924,7 +936,7 @@ export class TelegramBridge implements Hub {
 			// rest of this chat's queue (the mirror keeps it alive while pi runs).
 			void this.bot?.sendChatAction(chatId, "typing");
 		} catch (error) {
-			await this.sendHtml(chatId, `⚠️ pi에 보내지 못했어요: ${escapeHtml(redactSecrets(errorMessage(error)))}`);
+			await this.sendHtml(chatId, (lang) => `⚠️ ${pick(lang, "pi에 보내지 못했어요", "pi could not receive it")}: ${escapeHtml(redactSecrets(errorMessage(error)))}`);
 		}
 	}
 
@@ -941,12 +953,15 @@ export class TelegramBridge implements Hub {
 		const usage = this.eventCtx?.getContextUsage();
 		// One fact per line. These notices used to stack the trigger and a follow-up clause on one
 		// line, which on a phone read as a sentence with another sentence glued to its end.
-		const lines = [`🗜 <i>컨텍스트 압축 중…</i>`];
-		if (usage?.tokens != null) lines.push(`· ${formatCount(usage.tokens)} tokens${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}`);
-		lines.push(`· ${compactionReasonLabel(reason)}`);
-		if (willRetry) lines.push("· 압축이 끝나면 지금 턴을 다시 시도해요.");
-		if (this.heldPrompts.length) lines.push(`· 이미 보낸 메시지 ${this.heldPrompts.length}개는 압축이 끝나면 자동으로 전달돼요.`);
-		await this.broadcast(lines.join("\n"), { markdown: false });
+		const lines: Localized = (lang) => {
+			const out = [`🗜 <i>${pick(lang, "컨텍스트 압축 중…", "compacting the context…")}</i>`];
+			if (usage?.tokens != null) out.push(`· ${formatCount(usage.tokens)} tokens${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}`);
+			out.push(`· ${compactionReasonLabel(reason, lang)}`);
+			if (willRetry) out.push(`· ${pick(lang, "압축이 끝나면 지금 턴을 다시 시도해요.", "this turn starts over once the summary is in.")}`);
+			if (this.heldPrompts.length) out.push(`· ${pick(lang, `이미 보낸 메시지 ${this.heldPrompts.length}개는 압축이 끝나면 자동으로 전달돼요.`, `the ${this.heldPrompts.length} message(s) you already sent go through on their own.`)}`);
+			return out.join("\n");
+		};
+		await this.broadcast(lines, { markdown: false });
 	}
 
 	private async announceCompactionDone(entry: { tokensBefore?: number } | undefined, reason: CompactionReason): Promise<void> {
@@ -954,19 +969,25 @@ export class TelegramBridge implements Hub {
 		this.compactingAt = 0;
 		const before = typeof entry?.tokensBefore === "number" ? formatCount(entry.tokensBefore) : undefined;
 		const after = this.eventCtx?.getContextUsage()?.tokens;
-		const lines = [`✅ <i>컨텍스트 압축 완료</i>`];
-		if (before) lines.push(`· ${before} → ${after != null ? formatCount(after) : "요약"}`);
-		if (elapsed) lines.push(`· ${elapsed}초 걸림`);
-		lines.push(`· ${compactionReasonLabel(reason)}`);
-		await this.broadcast(lines.join("\n"), { markdown: false });
+		const lines: Localized = (lang) => {
+			const out = [`✅ <i>${pick(lang, "컨텍스트 압축 완료", "context compacted")}</i>`];
+			if (before) out.push(`· ${before} → ${after != null ? formatCount(after) : pick(lang, "요약", "summary")}`);
+			if (elapsed) out.push(`· ${elapsed}${pick(lang, "초 걸림", "s")}`);
+			out.push(`· ${compactionReasonLabel(reason, lang)}`);
+			return out.join("\n");
+		};
+		await this.broadcast(lines, { markdown: false });
 	}
 
 	private async announceCompactionFailed(event: { aborted: boolean; errorMessage?: string; reason: CompactionReason }): Promise<void> {
 		this.compactingAt = 0;
 		const detail = cleanCompactionError(event.errorMessage);
-		const lines = [`⚠️ <i>컨텍스트 압축 ${event.aborted ? "중단" : "실패"}</i>`, `· ${compactionReasonLabel(event.reason)}`];
-		if (detail) lines.push(`· 오류: ${escapeHtml(truncate(redactSecrets(detail), 300))}`);
-		await this.broadcast(lines.join("\n"), { markdown: false });
+		const lines: Localized = (lang) => {
+			const out = [`⚠️ <i>${pick(lang, "컨텍스트 압축", "compaction")} ${event.aborted ? pick(lang, "중단", "stopped") : pick(lang, "실패", "failed")}</i>`, `· ${compactionReasonLabel(event.reason, lang)}`];
+			if (detail) out.push(`· ${pick(lang, "오류", "error")}: ${escapeHtml(truncate(redactSecrets(detail), 300))}`);
+			return out.join("\n");
+		};
+		await this.broadcast(lines, { markdown: false });
 	}
 
 	private releaseContextBusy(reason: string): void {
@@ -987,13 +1008,14 @@ export class TelegramBridge implements Hub {
 				void this.bot?.sendChatAction(entry.chatId, "typing");
 			} catch (error) {
 				this.reportError("held prompt", error);
-				await this.sendHtml(entry.chatId, `⚠️ 압축 뒤에 보내려던 메시지를 전달하지 못했어요: ${escapeHtml(redactSecrets(errorMessage(error)))}`);
+				await this.sendHtml(entry.chatId, (lang) => `⚠️ ${pick(lang, "압축 뒤에 보내려던 메시지를 전달하지 못했어요", "the message parked behind the compaction could not be delivered")}: ${escapeHtml(redactSecrets(errorMessage(error)))}`);
 			}
 		}
 		this.dbg("held prompts released", reason, held.length);
 		const perChat = new Map<number, number>();
 		for (const entry of held) perChat.set(entry.chatId, (perChat.get(entry.chatId) ?? 0) + 1);
-		for (const [chat, count] of perChat) await this.sendHtml(chat, `✅ <i>압축 끝 — 기다리던 메시지 ${count}개를 pi에 보냈어요.</i>`);
+		for (const [chat, count] of perChat)
+			await this.sendHtml(chat, (lang) => `✅ <i>${pick(lang, `압축 끝 — 기다리던 메시지 ${count}개를 pi에 보냈어요.`, `compaction over — the ${count} waiting message(s) went to pi.`)}</i>`);
 	}
 
 	private watchPrompt(chatId: number): void {
@@ -1025,34 +1047,37 @@ export class TelegramBridge implements Hub {
 		if (!this.bot) return; // bridge already stopped; the replacement instance owns the chat now
 		const ctx = this.eventCtx;
 		if (ctx && !ctx.isIdle()) return; // a run is in flight, it was just slow to announce
-		const model = this.currentModelKey() ?? "없음";
-		const why = !ctx
-			? "브리지에 pi 세션 정보가 없어요. /tg restart 후 다시 시도하세요."
+		const model = this.currentModelKey();
+		const why: Localized = !ctx
+			? L("브리지에 pi 세션 정보가 없어요. /tg restart 후 다시 시도하세요.", "the bridge has no pi session — try /tg restart and send it again.")
 			: !ctx.model
-				? "선택된 모델이 없어요 — pi 터미널에서 /model 또는 /login 으로 provider를 연결하세요."
-				: "pi가 실행을 시작하지 않았어요 — provider 인증이나 모델 설정을 확인하세요 (pi 터미널에 오류가 찍혔을 수 있어요).";
-		const lastError = this.lastError ? `\n마지막 브리지 오류: ${escapeHtml(redactSecrets(truncate(this.lastError, 200)))}` : "";
-		this.dbg("prompt watchdog fired", chatId, "model:", model);
-		await this.sendHtml(chatId, `⚠️ <b>프롬프트가 pi에서 실행되지 않았어요</b>\n모델 <code>${escapeHtml(model)}</code> · ${escapeHtml(why)}\n/status 로 상태를 확인하세요.${lastError}`);
+				? L("선택된 모델이 없어요 — pi 터미널에서 /model 또는 /login 으로 provider를 연결하세요.", "no model is selected — connect a provider with /model or /login in the pi terminal.")
+				: L("pi가 실행을 시작하지 않았어요 — provider 인증이나 모델 설정을 확인하세요 (pi 터미널에 오류가 찍혔을 수 있어요).", "pi never started the run — check the provider credentials and the model (an error was probably printed in the pi terminal).");
+		this.dbg("prompt watchdog fired", chatId, "model:", model ?? "none");
+		await this.sendHtml(
+			chatId,
+			(lang) =>
+				`⚠️ <b>${pick(lang, "프롬프트가 pi에서 실행되지 않았어요", "pi never ran that prompt")}</b>\n${pick(lang, "모델", "model")} <code>${escapeHtml(model ?? pick(lang, "없음", "none"))}</code> · ${escapeHtml(why(lang))}\n${pick(lang, "/status 로 상태를 확인하세요.", "check /status for details.")}${this.lastError ? `\n${pick(lang, "마지막 브리지 오류", "last bridge error")}: ${escapeHtml(redactSecrets(truncate(this.lastError, 200)))}` : ""}`,
+		);
 	}
 
 	private async collectAttachments(chatId: number, message: TgMessage): Promise<ImagePart[]> {
 		if (!this.bot) return [];
 		this.dbg("attachments", chatId, "photo:", message.photo?.length ?? 0, "doc:", message.document?.file_name ?? "-", "voice:", message.voice ? 1 : 0);
 		const images: ImagePart[] = [];
-		const notes: string[] = [];
+		const notes: Localized[] = [];
 		const photo = message.photo?.length ? message.photo[message.photo.length - 1] : undefined;
 		if (photo) {
 			try {
 				images.push(await this.downloadImage(photo.file_id));
 			} catch (error) {
-				notes.push(`image download failed: ${errorMessage(error)}`);
+				notes.push((lang) => `${pick(lang, "이미지 다운로드 실패", "image download failed")}: ${errorMessage(error)}`);
 			}
 		}
 		const document = message.document;
 		const oversized = Boolean(document?.file_size && document.file_size > MAX_ATTACHMENT_BYTES);
 		if (oversized && document?.file_size) {
-			notes.push(`파일이 너무 커요 (${formatBytes(document.file_size)}, 최대 ${formatBytes(MAX_ATTACHMENT_BYTES)}) — 더 작은 조각으로 보내 주세요`);
+			notes.push((lang) => `${pick(lang, "파일이 너무 커요", "that file is too large")} (${formatBytes(document?.file_size ?? 0)}, ${pick(lang, "최대", "max")} ${formatBytes(MAX_ATTACHMENT_BYTES)}) — ${pick(lang, "더 작은 조각으로 보내 주세요", "send it in smaller pieces")}`);
 		}
 		if (document && !oversized) {
 			const mime = document.mime_type ?? "";
@@ -1061,7 +1086,7 @@ export class TelegramBridge implements Hub {
 				try {
 					images.push(await this.downloadImage(document.file_id));
 				} catch (error) {
-					notes.push(`image download failed: ${errorMessage(error)}`);
+					notes.push((lang) => `${pick(lang, "이미지 다운로드 실패", "image download failed")}: ${errorMessage(error)}`);
 				}
 			} else if (isTextLike(document.file_name, mime)) {
 				try {
@@ -1071,18 +1096,19 @@ export class TelegramBridge implements Hub {
 					const body = Buffer.from(raw).toString("utf8");
 					this.pi.sendUserMessage([{ type: "text", text: `Attached file from Telegram: ${name}\n\n\`\`\`\n${truncate(body, 24_000)}\n\`\`\`` }]);
 				} catch (error) {
-					notes.push(`file read failed: ${errorMessage(error)}`);
+					notes.push((lang) => `${pick(lang, "파일 읽기 실패", "file read failed")}: ${errorMessage(error)}`);
 				}
 			} else {
 				notes.push(
-					`unsupported attachment: ${safeFileName(document.file_name ?? "")} (${formatBytes(document.file_size ?? 0)}) — pi가 바로 읽지 못해요. 파일은 컴퓨터에 있으니 경로를 알려주세요`,
+					(lang) =>
+						`${pick(lang, "첨부한 파일을 읽을 수 없어요", "unsupported attachment")}: ${safeFileName(document.file_name ?? "")} (${formatBytes(document.file_size ?? 0)}) — ${pick(lang, "pi가 바로 읽지 못해요. 파일은 컴퓨터에 있으니 경로를 알려주세요", "pi cannot read it directly — the file lives on the machine, so send me its path")}`,
 				);
 			}
 		}
-		if (message.audio || message.voice) notes.push("voice messages are not transcribed — send text");
-		if (message.video || message.animation || message.video_note) notes.push("video is not forwarded to pi");
-		if (message.sticker) notes.push(`sticker ${message.sticker.emoji ?? ""}`.trim());
-		if (notes.length) await this.sendHtml(chatId, `ℹ️ ${escapeHtml(notes.join(" · "))}`).catch(() => undefined);
+		if (message.audio || message.voice) notes.push((lang) => pick(lang, "음성 메시지는 텍스트로 바뀌지 않아요 — 글로 보내 주세요", "voice messages are not transcribed — send text"));
+		if (message.video || message.animation || message.video_note) notes.push((lang) => pick(lang, "동영상은 pi로 넘기지 않아요", "video is not forwarded to pi"));
+		if (message.sticker) notes.push((lang) => `${pick(lang, "스티커", "sticker")} ${message.sticker?.emoji ?? ""}`.trim());
+		if (notes.length) await this.sendHtml(chatId, (lang) => `ℹ️ ${escapeHtml(notes.map((note) => (typeof note === "string" ? note : note(lang))).join(" · "))}`).catch(() => undefined);
 		return images;
 	}
 
@@ -1109,14 +1135,14 @@ export class TelegramBridge implements Hub {
 			return;
 		}
 		if (!this.isPaired(chatId)) {
-			await this.bot?.answerCallbackQuery(query.id, "pairing required", true);
+			await this.bot?.answerCallbackQuery(query.id, pick(this.lang(chatId), "이 채팅은 아직 pairing 되지 않았어요", "this chat is not paired yet"), true);
 			return;
 		}
 		const token = data.slice(CALLBACK_PREFIX.length);
 		const entry = this.tokens.get(token);
 		this.dbg("callback", data, "known:", Boolean(entry), "action:", entry?.action.kind);
 		if (!entry) {
-			await this.bot?.answerCallbackQuery(query.id, "이 버튼은 만료됐어요 — /help 로 다시 여세요", true);
+			await this.bot?.answerCallbackQuery(query.id, pick(this.lang(chatId), "이 버튼은 만료됐어요 — /help 로 다시 여세요", "that button has expired — open /help again"), true);
 			if (query.message && chatId) await this.bot?.clearKeyboard(chatId, query.message.message_id);
 			return;
 		}
@@ -1124,7 +1150,7 @@ export class TelegramBridge implements Hub {
 			// A button is for the chat it was rendered into. Without this, any paired chat (or any member
 			// of a paired group) could replay another chat's keyboard — switch models, resume a foreign
 			// session, unpair a chat.
-			await this.bot?.answerCallbackQuery(query.id, "이 버튼은 다른 채팅에서 열린 거예요", true);
+			await this.bot?.answerCallbackQuery(query.id, pick(this.lang(chatId), "이 버튼은 다른 채팅에서 열린 거예요", "that button belongs to a different chat"), true);
 			this.dbg("callback token from the wrong chat", chatId, "->", entry.chatId);
 			this.notifyUi(this.eventCtx, `telegram: ignored a keyboard tap from chat ${chatId} — that button belongs to ${entry.chatId}`, "warning");
 			return;
@@ -1150,7 +1176,7 @@ export class TelegramBridge implements Hub {
 			if (result.keep) this.keepToken(token);
 			else this.dropToken(token);
 		} catch (error) {
-			await this.bot?.answerCallbackQuery(query.id, "실패", true);
+			await this.bot?.answerCallbackQuery(query.id, pick(this.lang(chatId), "실패", "failed"), true);
 			this.notifyUi(this.eventCtx, `telegram callback failed: ${errorMessage(error)}`, "warning");
 		}
 	}
@@ -1200,12 +1226,12 @@ export class TelegramBridge implements Hub {
 		}
 	}
 
-	async sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: string): Promise<void> {
+	async sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: Localized): Promise<void> {
 		if (!this.bot) throw new Error("telegram bridge is not running");
 		// A file leaves this machine for Telegram's servers and the phone: scrub our own credentials.
-		caption = caption ? scrubKnownSecrets(caption) : caption;
-		if (/\.(png|jpe?g|gif|webp)$/i.test(fileName)) await this.bot.sendPhoto(chatId, data, fileName, caption);
-		else await this.bot.sendDocument(chatId, data, fileName, caption);
+		const shown = caption === undefined ? undefined : scrubKnownSecrets(render(caption, this.lang(chatId)));
+		if (/\.(png|jpe?g|gif|webp)$/i.test(fileName)) await this.bot.sendPhoto(chatId, data, fileName, shown);
+		else await this.bot.sendDocument(chatId, data, fileName, shown);
 	}
 
 	async broadcastFile(data: Uint8Array, fileName: string, caption?: string): Promise<void> {
@@ -1232,7 +1258,7 @@ export class TelegramBridge implements Hub {
 		this.notifyUi(this.eventCtx, text, level);
 	}
 
-	observeGoal(result: unknown): string | undefined {
+	observeGoal(result: unknown): Localized | undefined {
 		return this.goalView.observeToolResult(result);
 	}
 
@@ -1298,10 +1324,10 @@ export class TelegramBridge implements Hub {
 		this.eventCtx?.abort();
 	}
 
-	compactRun(instructions?: string): { ok: boolean; error?: string } {
+	compactRun(instructions?: string): { ok: boolean; error?: Localized } {
 		const ctx = this.tryPiContext();
-		if (!ctx) return { ok: false, error: "pi 세션이 없음" };
-		if (!ctx.isIdle()) return { ok: false, error: "실행 중에는 압축할 수 없어요 (/abort 먼저)" };
+		if (!ctx) return { ok: false, error: L("pi에 활성 세션이 없어요", "pi has no live session") };
+		if (!ctx.isIdle()) return { ok: false, error: L("실행 중에는 압축할 수 없어요 (/abort 먼저)", "pi is running — /abort first") };
 		try {
 			ctx.compact(instructions ? { customInstructions: instructions } : undefined);
 			return { ok: true };
@@ -1432,14 +1458,14 @@ export class TelegramBridge implements Hub {
 			.sort((a, b) => Number(b.local) - Number(a.local) || Number(a.needsAuth) - Number(b.needsAuth) || b.count - a.count || a.provider.localeCompare(b.provider));
 	}
 
-	async setModelByKey(key: string): Promise<{ ok: boolean; error?: string; resolved?: string; custom?: { id: string; template: string } }> {
+	async setModelByKey(key: string): Promise<{ ok: boolean; error?: Localized; resolved?: string; custom?: { id: string; template: string } }> {
 		const ctx = this.tryPiContext();
-		if (!ctx) return { ok: false, error: "pi 세션이 없음" };
+		if (!ctx) return { ok: false, error: L("pi에 활성 세션이 없어요", "pi has no live session") };
 		const wanted = key.trim();
 		const separator = wanted.indexOf("/");
 		const provider = separator > 0 ? wanted.slice(0, separator) : wanted;
 		const modelId = separator > 0 ? wanted.slice(separator + 1) : "";
-		if (!modelId) return { ok: false, error: `모델 id가 없어요: ${wanted} · provider/id 형태로 입력하세요` };
+		if (!modelId) return { ok: false, error: L(`모델 id가 없어요: ${wanted} · provider/id 형태로 입력하세요`, `no model id in ${wanted} · write it as provider/id`) };
 		const all = this.allChatModels(ctx.modelRegistry);
 		const lower = wanted.toLowerCase();
 		// pi's model store marks "track the latest" entries with a leading ~; users type the plain id.
@@ -1452,7 +1478,7 @@ export class TelegramBridge implements Hub {
 		if (target) {
 			try {
 				const ok = await this.pi.setModel(target as never);
-				if (!ok) return { ok: false, error: "🔑 이 provider의 인증 설정이 필요해요 (pi 터미널에서 /login)" };
+				if (!ok) return { ok: false, error: L("🔑 이 provider의 인증 설정이 필요해요 (pi 터미널에서 /login)", "🔑 this provider needs signing in — /login in the pi terminal") };
 				return { ok: true, resolved: `${target.provider}/${target.id}` };
 			} catch (error) {
 				return { ok: false, error: errorMessage(error) };
@@ -1464,17 +1490,17 @@ export class TelegramBridge implements Hub {
 		const aggregator = known ? undefined : inferAggregatorProvider(all);
 		const providerForClone = known ? provider : aggregator;
 		if (!providerForClone) {
-			return { ok: false, error: `🚫 provider를 모르겠어요: ${provider} · /model <provider>/<id> 또는 /model <검색어>로 찾아보세요` };
+			return { ok: false, error: L(`🚫 provider를 모르겠어요: ${provider} · /model <provider>/<id> 또는 /model <검색어>로 찾아보세요`, `🚫 unknown provider ${provider} · try /model <provider>/<id> or search with /model <term>`) };
 		}
 		// An inferred aggregator keeps the manufacturer: an openrouter id *is* `nvidia/nemotron…:free`.
 		const cloneId = providerForClone === provider ? modelId : wanted;
 		const siblings = all.filter((candidate) => candidate.provider === providerForClone);
 		const family = siblings.find((candidate) => candidate.id.split("/")[0] === cloneId.split("/")[0]);
 		const template = family ?? siblings.find((candidate) => candidate.id.includes("/")) ?? siblings[0];
-		if (!template) return { ok: false, error: `model not found: ${key} · provider를 모르겠어요 (/model)` };
+		if (!template) return { ok: false, error: L(`🚫 model not found: ${key} · provider를 모르겠어요 (/model)`, `🚫 model not found: ${key} · unknown provider (/model)`) };
 		try {
 			const ok = await this.pi.setModel({ ...template, id: cloneId, name: cloneId } as never);
-			if (!ok) return { ok: false, error: "🔑 이 provider의 인증 설정이 필요해요 (pi 터미널에서 /login)" };
+			if (!ok) return { ok: false, error: L("🔑 이 provider의 인증 설정이 필요해요 (pi 터미널에서 /login)", "🔑 this provider needs signing in — /login in the pi terminal") };
 			return { ok: true, resolved: `${providerForClone}/${cloneId}`, custom: { id: cloneId, template: `${template.provider}/${template.id}` } };
 		} catch (error) {
 			return { ok: false, error: errorMessage(error) };
@@ -1485,8 +1511,8 @@ export class TelegramBridge implements Hub {
 		return this.pi.getThinkingLevel();
 	}
 
-	setThinkingLevel(level: string): { ok: boolean; error?: string } {
-		if (!THINKING_LEVELS.includes(level)) return { ok: false, error: `unknown level: ${level}` };
+	setThinkingLevel(level: string): { ok: boolean; error?: Localized } {
+		if (!THINKING_LEVELS.includes(level)) return { ok: false, error: L(`모르는 thinking 레벨: ${level}`, `unknown thinking level: ${level}`) };
 		try {
 			this.pi.setThinkingLevel(level as (typeof THINKING_LEVEL_VALUES)[number]);
 			return { ok: true };
@@ -1717,6 +1743,17 @@ export class TelegramBridge implements Hub {
 		return "default";
 	}
 
+	/**
+	 * Output that belongs to no one chat — pi's terminal status line, mostly. The config decides if it
+	 * says anything; otherwise the first paired chat speaks for the operator, and with no chats at all
+	 * the terminal keeps the Korean this bridge has printed since the first commit.
+	 */
+	defaultLang(): Lang {
+		if (this.cfg.language) return this.cfg.language;
+		const first = this.cfg.chats[0];
+		return first ? this.lang(first.chatId) : "ko";
+	}
+
 	pairThisChat(chatId: number): void {
 		this.addChat(chatId, this.chatTitles.get(chatId) ?? this.cfg.chats.find((chat) => chat.chatId === chatId)?.label ?? `chat ${chatId}`);
 	}
@@ -1771,8 +1808,13 @@ export class TelegramBridge implements Hub {
 			this.menuShadowed = ours.some((name) => !this.menuServed.includes(name));
 			if (this.menuShadowed) {
 				const foreign = this.menuServed.filter((name) => !ours.includes(name));
-				this.notifyUi(this.eventCtx, 
-					`telegram 메뉴가 다른 프로그램에 의해 덮어써졌어요 — 같은 토큰을 쓰는 다른 pi/브리지 프로세스를 끄고 /tg menu 로 다시 등록하세요 (다른 목록 ${foreign.length}개: ${foreign.slice(0, 6).join(", ")})`,
+				this.notifyUi(
+					this.eventCtx,
+					pick(
+						this.defaultLang(),
+						`telegram 메뉴가 다른 프로그램에 의해 덮어써졌어요 — 같은 토큰을 쓰는 다른 pi/브리지 프로세스를 끄고 /tg menu 로 다시 등록하세요 (다른 목록 ${foreign.length}개: ${foreign.slice(0, 6).join(", ")})`,
+						`the telegram command menu is shadowed by another program — stop the other pi/bridge sharing this token and re-register with /tg menu (foreign list ${foreign.length}: ${foreign.slice(0, 6).join(", ")})`,
+					),
 					"warning",
 				);
 			}
@@ -1944,9 +1986,11 @@ type CompactionReason = "manual" | "threshold" | "overflow";
  * pi tells us what triggered a compaction; the chat should not have to guess. Each label is a phrase
  * that reads on its own, because it stands on a line of its own in the notice.
  */
-function compactionReasonLabel(reason: CompactionReason): string {
+function compactionReasonLabel(reason: CompactionReason, lang: Lang): string {
 	if (reason === "manual") return "/compact";
-	return reason === "threshold" ? "컨텍스트 임계값에 도달해서 자동 압축" : "컨텍스트를 넘겨서 자동 압축 후 재시도";
+	return reason === "threshold"
+		? pick(lang, "컨텍스트 임계값에 도달해서 자동 압축", "compacted automatically at the context threshold")
+		: pick(lang, "컨텍스트를 넘겨서 자동 압축 후 재시도", "the context overflowed — compacted, then the turn retried");
 }
 
 /**

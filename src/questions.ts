@@ -14,6 +14,8 @@
  * and capped: a malformed or hostile questionnaire must never crash the bridge or flood a chat.
  */
 import type { CallbackAction, CallbackActionKind, CallbackEntry, CallbackResult, Hub } from "./hub.ts";
+import type { Lang, Localized } from "./i18n.ts";
+import { L, pick } from "./i18n.ts";
 import { escapeHtml, inlineCode, tgDebug, truncate } from "./format.ts";
 import type { TgInlineKeyboardButton } from "./telegram.ts";
 
@@ -105,7 +107,7 @@ export class QuestionnaireBridge {
 		return this.open.size;
 	}
 
-	closeAll(reason: string): void {
+	closeAll(reason: Localized): void {
 		for (const [toolCallId] of [...this.open]) this.close(toolCallId, reason);
 	}
 
@@ -139,7 +141,7 @@ export class QuestionnaireBridge {
 			return true;
 		}
 		await this.rerender(question);
-		await this.hub.send(chatId, `✏️ <i>${waiting.index + 1}번 답변을 적어 두었어요. 나머지 질문에 답한 뒤 ✅ 제출 버튼으로 보내 주세요.</i>`, { markdown: false });
+		await this.hub.send(chatId, L(`✏️ <i>${waiting.index + 1}번 답변을 적어 두었어요. 나머지 질문에 답한 뒤 ✅ 제출 버튼으로 보내 주세요.</i>`, `✏️ <i>saved your answer to question ${waiting.index + 1}. Answer the rest and press ✅ submit.</i>`), { markdown: false });
 		return true;
 	}
 
@@ -147,7 +149,8 @@ export class QuestionnaireBridge {
 		const action = entry.action;
 		const toolCallId = typeof action.blob === "object" && action.blob !== null ? (action.blob as { toolCallId?: string }).toolCallId : undefined;
 		const question = toolCallId ? this.open.get(toolCallId) : undefined;
-		if (!question) return { toast: "그 질문은 이미 끝났어요", showAlert: true };
+		const lang = this.hub.lang(chatId);
+		if (!question) return { toast: pick(lang, "그 질문은 이미 끝났어요", "that question is already over"), showAlert: true };
 		const blob = action.blob as { index?: number; option?: number };
 		const index = blob?.index ?? -1;
 		const option = blob?.option;
@@ -155,39 +158,39 @@ export class QuestionnaireBridge {
 		switch (action.kind) {
 			case "askq:cancel":
 				await this.submit(question, chatId, true);
-				return { toast: "거절했어요" };
+				return { toast: pick(lang, "거절했어요", "cancelled") };
 			case "askq:submit":
 				if (!this.answeredAll(question)) {
 					const missing = question.answers.map((answer, i) => (answer ? null : i + 1)).filter(Boolean);
-					return { toast: `아직 안 고른 질문: ${missing.join(", ")}`, showAlert: true };
+					return { toast: pick(lang, `아직 안 고른 질문: ${missing.join(", ")}`, `questions still unanswered: ${missing.join(", ")}`), showAlert: true };
 				}
 				await this.submit(question, chatId);
-				return { toast: "보냈어요" };
+				return { toast: pick(lang, "보냈어요", "sent") };
 			case "askq:text": {
 				question.awaitingText.set(chatId, { index, expiresAt: Date.now() + TEXT_WINDOW_MS });
 				this.startTextTimer(chatId, question);
 				await this.rerender(question);
-				return { toast: "이제 채팅에 답을 적어 보내세요", keep: true };
+				return { toast: pick(lang, "이제 채팅에 답을 적어 보내세요", "now type your answer in this chat"), keep: true };
 			}
 			case "askq:multi": {
-				if (option === undefined) return { toast: "항목을 찾을 수 없어요", showAlert: true };
+				if (option === undefined) return { toast: pick(lang, "항목을 찾을 수 없어요", "that option is gone"), showAlert: true };
 				const current = question.answers[index] ?? { indexes: [] };
 				current.indexes = current.indexes.includes(option) ? current.indexes.filter((i) => i !== option) : [...current.indexes, option];
 				delete current.text;
 				question.answers[index] = current;
 				await this.rerender(question);
-				return { toast: current.indexes.includes(option) ? "선택했어요" : "해제했어요", keep: true };
+				return { toast: current.indexes.includes(option) ? pick(lang, "선택했어요", "selected") : pick(lang, "해제했어요", "deselected"), keep: true };
 			}
 			case "askq:option": {
-				if (option === undefined) return { toast: "항목을 찾을 수 없어요", showAlert: true };
+				if (option === undefined) return { toast: pick(lang, "항목을 찾을 수 없어요", "that option is gone"), showAlert: true };
 				if (question.questions.length === 1 && !question.questions[0].multi) {
 					question.answers[0] = { indexes: [option] };
 					await this.submit(question, chatId);
-					return { toast: question.questions[0].choices[option]?.label?.slice(0, 48) ?? "선택했어요" };
+					return { toast: question.questions[0].choices[option]?.label?.slice(0, 48) ?? pick(lang, "선택했어요", "selected") };
 				}
 				question.answers[index] = { indexes: [option] };
 				await this.rerender(question);
-				return { toast: "선택했어요 — 제출 버튼으로 마무리", keep: true };
+				return { toast: pick(lang, "선택했어요 — 제출 버튼으로 마무리", "selected — press submit to finish"), keep: true };
 			}
 			default:
 				return { toast: "" };
@@ -244,15 +247,23 @@ export class QuestionnaireBridge {
 			this.open.delete(toolCallId);
 			return;
 		}
-		this.hub.notify(`telegram: pi는 선택을 기다려요 (ask_user_question · ${questions.length} question(s)) — 답은 pi 터미널에서도 가능`, "info");
+		this.hub.notify(
+			pick(
+				this.hub.defaultLang(),
+				`telegram: pi는 선택을 기다려요 (ask_user_question · ${questions.length} question(s)) — 답은 pi 터미널에서도 가능`,
+				`telegram: pi is waiting for a choice (ask_user_question · ${questions.length} question(s)) — the pi terminal can answer too`,
+			),
+			"info",
+		);
 	}
 
 	private async onBlocked(data: unknown): Promise<void> {
 		const payload = asRecord(data);
 		if (!payload || payload.active !== false) return;
 		const toolCallId = stringOr(payload.toolCallId);
-		if (toolCallId) this.close(toolCallId, "질문이 닫혔어요 (pi 터미널에서 답했거나 취소됐어요).");
-		else this.closeAll("질문이 닫혔어요 (pi 터미널에서 답했거나 취소됐어요).");
+		const closedNote = L("질문이 닫혔어요 (pi 터미널에서 답했거나 취소됐어요).", "the question closed (answered or cancelled in the pi terminal).");
+		if (toolCallId) this.close(toolCallId, closedNote);
+		else this.closeAll(closedNote);
 	}
 
 	private onAnswerResult(data: unknown): void {
@@ -261,12 +272,14 @@ export class QuestionnaireBridge {
 		const code = stringOr(payload.code) ?? "unknown";
 		const toolCallId = stringOr(payload.toolCallId);
 		const toolCallIdOk = toolCallId ? this.open.has(toolCallId) : true;
-		const note = RESULT_TEXT[code] ?? `답변이 접수되지 않았어요 (${code}).`;
+		const note = RESULT_TEXT[code] ?? ((lang: Lang) => pick(lang, `답변이 접수되지 않았어요 (${code}).`, `the answer was not accepted (${code}).`));
 		this.hub.notify(`telegram: ask_user_question rejected an answer — ${code}`, "warning");
 		this.dbg("answer rejected", code, toolCallId);
 		if (code === "not_found" && toolCallId && !toolCallIdOk) return; // already closed locally, no need to shout
 		for (const chatId of this.hub.chats()) {
-			void this.hub.send(chatId, `⚠️ <i>${escapeHtml(note)}</i>`, { markdown: false }).catch(() => undefined);
+			void this.hub
+				.send(chatId, (lang) => `⚠️ <i>${escapeHtml(note(lang))}</i>`, { markdown: false })
+				.catch(() => undefined);
 		}
 	}
 
@@ -300,7 +313,7 @@ export class QuestionnaireBridge {
 			answers: cancel ? [] : this.buildAnswers(question),
 			...(cancel ? { cancel: true } : {}),
 		};
-		this.close(question.toolCallId, cancel ? "거절했어요 — pi 터미널에서도 같은 질문이 닫혀요." : "✅ 답변을 pi에 전달했어요.");
+		this.close(question.toolCallId, cancel ? L("거절했어요 — pi 터미널에서도 같은 질문이 닫혀요.", "cancelled — the same question closes in the pi terminal too.") : L("✅ 답변을 pi에 전달했어요.", "✅ the answer reached pi."));
 		try {
 			bus.emit(ASK_ANSWER_EVENT, payload);
 			this.hub.notify(
@@ -312,7 +325,7 @@ export class QuestionnaireBridge {
 		}
 	}
 
-	private close(toolCallId: string, note: string): void {
+	private close(toolCallId: string, note: Localized): void {
 		const question = this.open.get(toolCallId);
 		if (!question) return;
 		this.open.delete(toolCallId);
@@ -325,11 +338,13 @@ export class QuestionnaireBridge {
 		this.textTimers.clear();
 		for (const { chatId, messageId } of question.rendered) {
 			if (messageId === undefined) continue;
+			const lang = this.hub.lang(chatId);
+			const body = typeof note === "string" ? note : note(lang);
 			void this.hub
-				.editKeyboard(chatId, messageId, `${questionHeadline(question)}\n\n<i>${escapeHtml(note)}</i>`, [])
+				.editKeyboard(chatId, messageId, `${questionHeadline(question, lang)}\n\n<i>${escapeHtml(body)}</i>`, [])
 				.catch(() => undefined);
 		}
-		this.dbg("questionnaire closed", toolCallId, note.slice(0, 30));
+		this.dbg("questionnaire closed", toolCallId, (typeof note === "string" ? note : note(this.hub.defaultLang())).slice(0, 30));
 	}
 
 	private dropTokens(toolCallId: string): void {
@@ -357,12 +372,13 @@ export class QuestionnaireBridge {
 	// ------------------------------------------------------------------ rendering
 
 	private render(question: Questionnaire, chatId: number): { html: string; rows: TgInlineKeyboardButton[][] } {
-		const parts: string[] = [questionHeadline(question)];
+		const lang = this.hub.lang(chatId);
+		const parts: string[] = [questionHeadline(question, lang)];
 		const rows: TgInlineKeyboardButton[][] = [];
 		question.questions.forEach((item, index) => {
 			const answer = question.answers[index];
 			const label = question.questions.length > 1 ? `<b>${index + 1}. ${escapeHtml(truncate(item.text, MAX_QUESTION_TEXT))}</b>` : `<b>${escapeHtml(truncate(item.text, MAX_QUESTION_TEXT))}</b>`;
-			const meta = [item.header ? escapeHtml(item.header) : undefined, item.multi ? "여러 개 선택" : "하나 선택"].filter(Boolean).join(" · ");
+			const meta = [item.header ? escapeHtml(item.header) : undefined, item.multi ? pick(lang, "여러 개 선택", "choose any") : pick(lang, "하나 선택", "choose one")].filter(Boolean).join(" · ");
 			parts.push(`${label}${meta ? `\n<i>${meta}</i>` : ""}`);
 			if (item.choices.length) {
 				parts.push(
@@ -370,12 +386,12 @@ export class QuestionnaireBridge {
 						.map((choice, optionIndex) => {
 							const chosen = answer?.indexes.includes(optionIndex);
 							const description = choice.description ? ` — <i>${escapeHtml(truncate(choice.description, MAX_DESCRIPTION_TEXT))}</i>` : "";
-							return `${chosen ? "✅" : "▫️"} <b>${escapeHtml(truncate(choice.label, MAX_OPTION_TEXT))}</b>${description}${choice.hasPreview ? " <i>(미리보기 있음)</i>" : ""}`;
+							return `${chosen ? "✅" : "▫️"} <b>${escapeHtml(truncate(choice.label, MAX_OPTION_TEXT))}</b>${description}${choice.hasPreview ? ` ${pick(lang, "<i>(미리보기 있음)</i>", "<i>(preview available)</i>")}` : ""}`;
 						})
 						.join("\n"),
 				);
 			}
-			if (answer?.text) parts.push(`✏️ 답: ${inlineCode(truncate(answer.text, MAX_OPTION_TEXT))}`);
+			if (answer?.text) parts.push(`✏️ ${pick(lang, "답", "answer")}: ${inlineCode(truncate(answer.text, MAX_OPTION_TEXT))}`);
 			// Option buttons first, then the typed-answer escape hatch the package always offers.
 			for (let start = 0; start < item.choices.length; start += 2) {
 				rows.push(
@@ -395,18 +411,18 @@ export class QuestionnaireBridge {
 			const textToken = this.hub.createToken({ kind: "askq:text", blob: { toolCallId: question.toolCallId, index } }, chatId);
 			this.tokens.set(textToken, question.toolCallId);
 			const waiting = question.awaitingText.get(chatId)?.index === index;
-			rows.push([{ text: waiting ? "✏️ 지금 답 입력 중…" : `✏️ 직접 입력${question.questions.length > 1 ? ` (${index + 1})` : ""}`, callback_data: textToken }]);
+			rows.push([{ text: waiting ? pick(lang, "✏️ 지금 답 입력 중…", "✏️ typing now…") : `✏️ ${pick(lang, "직접 입력", "type an answer")}${question.questions.length > 1 ? ` (${index + 1})` : ""}`, callback_data: textToken }]);
 		});
 		const nav: TgInlineKeyboardButton[] = [];
 		const needsSubmit = question.questions.length > 1 || question.questions.some((item) => item.multi);
 		if (needsSubmit) {
 			const token = this.hub.createToken({ kind: "askq:submit", blob: { toolCallId: question.toolCallId } }, chatId);
 			this.tokens.set(token, question.toolCallId);
-			nav.push({ text: "✅ 제출", callback_data: token });
+			nav.push({ text: pick(lang, "✅ 제출", "✅ submit"), callback_data: token });
 		}
 		const cancelToken = this.hub.createToken({ kind: "askq:cancel", blob: { toolCallId: question.toolCallId } }, chatId);
 		this.tokens.set(cancelToken, question.toolCallId);
-		nav.push({ text: "✖️ 거절", callback_data: cancelToken });
+		nav.push({ text: pick(lang, "✖️ 거절", "✖️ cancel"), callback_data: cancelToken });
 		rows.push(nav);
 		return { html: parts.join("\n\n"), rows };
 	}
@@ -419,7 +435,9 @@ export class QuestionnaireBridge {
 			if (!waiting || !this.open.has(question.toolCallId)) return;
 			question.awaitingText.delete(chatId);
 			void this.rerender(question);
-			void this.hub.send(chatId, `⌛ <i>직접 입력 창이 만료됐어요. 다시 ✏️ 버튼을 누르거나 pi에 그냥 보내세요.</i>`, { markdown: false }).catch(() => undefined);
+			void this.hub
+				.send(chatId, L(`⌛ <i>직접 입력 창이 만료됐어요. 다시 ✏️ 버튼을 누르거나 pi에 그냥 보내세요.</i>`, `⌛ <i>the typed-answer window expired. Press ✏️ again, or just send the answer to pi as a message.</i>`), { markdown: false })
+				.catch(() => undefined);
 		}, TEXT_WINDOW_MS);
 		timer.unref?.();
 		this.textTimers.set(chatId, timer);
@@ -436,8 +454,12 @@ export class QuestionnaireBridge {
 	}
 }
 
-function questionHeadline(question: Questionnaire): string {
-	return `❓ <b>pi가 선택을 기다려요</b> <i>(ask_user_question · ${question.questions.length}개 질문)</i>`;
+function questionHeadline(question: Questionnaire, lang: Lang): string {
+	return pick(
+		lang,
+		`❓ <b>pi가 선택을 기다려요</b> <i>(ask_user_question · ${question.questions.length}개 질문)</i>`,
+		`❓ <b>pi is waiting for an answer</b> <i>(ask_user_question · ${question.questions.length} question${question.questions.length === 1 ? "" : "s"})</i>`,
+	);
 }
 
 function normalizeQuestion(raw: unknown): Question | undefined {
@@ -468,11 +490,11 @@ function normalizeChoice(raw: unknown): QuestionChoice | undefined {
 	};
 }
 
-const RESULT_TEXT: Record<string, string> = {
-	not_found: "그 질문은 이미 끝났어요 — pi 터미널에서 먼저 답했을 수 있어요.",
-	invalid_payload: "답변 형식이 pi가 기대한 것과 달라서 거부됐어요.",
-	invalid_answer: "답변이 질문과 맞지 않아요 — 항목을 다시 골라 주세요.",
-	unsupported_host: "이 pi는 원격 답변을 받지 않는 실행 방식이에요 — pi 터미널에서 답해야 해요.",
+const RESULT_TEXT: Record<string, (lang: Lang) => string> = {
+	not_found: (lang) => pick(lang, "그 질문은 이미 끝났어요 — pi 터미널에서 먼저 답했을 수 있어요.", "that question is already over — it may have been answered in the pi terminal first."),
+	invalid_payload: (lang) => pick(lang, "답변 형식이 pi가 기대한 것과 달라서 거부됐어요.", "the answer was rejected: its shape is not what pi expects."),
+	invalid_answer: (lang) => pick(lang, "답변이 질문과 맞지 않아요 — 항목을 다시 골라 주세요.", "the answer does not fit the question — pick the options again."),
+	unsupported_host: (lang) => pick(lang, "이 pi는 원격 답변을 받지 않는 실행 방식이에요 — pi 터미널에서 답해야 해요.", "this pi run does not accept remote answers — answer in the pi terminal."),
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -54,7 +54,7 @@ export interface TelegramConfig {
 	 * session and re-create this extension, so the instance that started the action is gone before
 	 * it can confirm; the fresh instance delivers this notice when it reconnects.
 	 */
-	pendingNotice?: { text: string; at: number };
+	pendingNotice?: { ko: string; en: string; at: number };
 }
 
 export const DEFAULT_CONFIG: TelegramConfig = {
@@ -122,9 +122,13 @@ export function loadConfig(): TelegramConfig {
 	if (typeof value.redactBash === "boolean") cfg.redactBash = value.redactBash;
 	if (typeof value.redactTranscript === "boolean") cfg.redactTranscript = value.redactTranscript;
 	if (typeof value.offset === "number") cfg.offset = value.offset;
-	const notice = value.pendingNotice;
-	if (notice && typeof notice.text === "string" && typeof notice.at === "number" && Date.now() - notice.at < NOTICE_TTL_MS) {
-		cfg.pendingNotice = { text: notice.text, at: notice.at };
+	const notice = value.pendingNotice as { ko?: string; en?: string; text?: string; at?: number } | undefined;
+	// Older installs wrote one string in one language; keep those readable and let the new shape carry
+	// both, because the notice is broadcast to every chat and each one reads it in its own language.
+	const ko = typeof notice?.ko === "string" ? notice.ko : typeof notice?.text === "string" ? notice.text : "";
+	const en = typeof notice?.en === "string" ? notice.en : ko;
+	if (ko && typeof notice?.at === "number" && Date.now() - notice.at < NOTICE_TTL_MS) {
+		cfg.pendingNotice = { ko, en, at: notice.at };
 	}
 	return cfg;
 }

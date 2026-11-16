@@ -13,7 +13,8 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Hub } from "./hub.ts";
-import type { Localized } from "./i18n.ts";
+import type { Lang, Localized } from "./i18n.ts";
+import { L, pick } from "./i18n.ts";
 import type { DraftManager } from "./draft.ts";
 import {
 	draftHtml,
@@ -97,7 +98,7 @@ export class OutboundMirror {
 	/** Subscribe to every pi event this module cares about. */
 	register(pi: ExtensionAPI): void {
 		pi.on("agent_start", () => {
-			this.hub.setWorkingNotice("⏳ pi 작업 중");
+			this.hub.setWorkingNotice(pick(this.hub.defaultLang(), "⏳ pi 작업 중", "⏳ pi working"));
 			this.startTyping();
 			// Anything that touches `turns` is queued: pi can fire turn_start while the previous turn's
 			// tool handlers are still in flight, and resetting the map synchronously loses their notes.
@@ -112,10 +113,11 @@ export class OutboundMirror {
 			this.enqueue(() => this.handleAgentEnd(event.messages ?? []));
 		});
 		pi.on("agent_settled", (event) => {
-			if (event.aborted) this.enqueue(() => this.sendHtmlAll("⛔ <i>중단했어요.</i>"));
+			if (event.aborted)
+				this.enqueue(() => this.sendHtmlAll(L("⛔ <i>중단했어요.</i>", "⛔ <i>stopped.</i>")));
 			this.enqueue(async () => {
 				this.stopActivityPulse();
-				await this.sealBoards(event.aborted ? "⛔ 중단됨" : "⚠️ 턴이 끝까지 가지 못했어요");
+				await this.sealBoards(event.aborted);
 				this.turns = new Map();
 			});
 			this.stopTyping();
@@ -191,7 +193,7 @@ export class OutboundMirror {
 		if (!this.hub.cfg.streaming) return;
 		for (const chatId of this.chats()) {
 			if (!this.turns.has(chatId)) this.turns.set(chatId, { tools: [], startedAt: Date.now() });
-			await this.drafts.update(chatId, "<i>⏳ 생각 중…</i>");
+			await this.drafts.update(chatId, pick(this.hub.lang(chatId), "<i>⏳ 생각 중…</i>", "<i>⏳ thinking…</i>"));
 		}
 	}
 
@@ -217,7 +219,9 @@ export class OutboundMirror {
 			return textFromContent(record.content).trim().length > 0;
 		});
 		if (produced) return;
-		await this.sendHtmlAll("⚠️ <i>pi가 답 없이 실행을 끝냈어요 — 모델·provider 설정을 확인하세요 (/status).</i>");
+		await this.sendHtmlAll(
+			L("⚠️ <i>pi가 답 없이 실행을 끝냈어요 — 모델·provider 설정을 확인하세요 (/status).</i>", "⚠️ <i>pi ended the run without answering — check the model and provider settings (/status).</i>"),
+		);
 	}
 
 	private async handleMessageEnd(message: unknown): Promise<void> {
@@ -337,7 +341,7 @@ export class OutboundMirror {
 			if (verbosity === 1) {
 				// The board is already on screen (it grew while the tools ran): finish it in place, so a
 				// turn leaves exactly one message behind.
-				const summary = this.summaryHtml(turn);
+				const summary = this.summaryHtml(turn, this.hub.lang(chatId));
 				const finished = await this.activity.finalize(chatId, summary);
 				if (finished === undefined) await this.sendHtml(chatId, summary);
 			} else {
@@ -345,7 +349,8 @@ export class OutboundMirror {
 				this.activity.release(chatId);
 			}
 			if (verbosity === 2) {
-				const bits: string[] = [`도구 ${turn.tools.length}회`];
+				const lang = this.hub.lang(chatId);
+				const bits: string[] = [pick(lang, `도구 ${turn.tools.length}회`, `${turn.tools.length} tool${turn.tools.length === 1 ? "" : "s"}`)];
 				const footer = usageLine(turn.usage, turn.durationMs);
 				if (footer) bits.push(footer);
 				await this.sendHtml(chatId, `<i>${escapeHtml(bits.join(" · "))}</i>`);
@@ -354,9 +359,9 @@ export class OutboundMirror {
 		this.turns = new Map();
 	}
 
-	private summaryHtml(turn: TurnSummary, tail?: string): string {
+	private summaryHtml(turn: TurnSummary, lang: Lang, tail?: string): string {
 		const footer = usageLine(turn.usage, turn.durationMs);
-		const headBits = [`🔧 <b>이번 턴</b> · ${turn.tools.length}회`];
+		const headBits = [pick(lang, `🔧 <b>이번 턴</b> · ${turn.tools.length}회`, `🔧 <b>this turn</b> · ${turn.tools.length} tool${turn.tools.length === 1 ? "" : "s"}`)];
 		if (footer) headBits.push(`<i>${escapeHtml(footer)}</i>`);
 		if (tail) headBits.push(`<i>${escapeHtml(tail)}</i>`);
 		const head = headBits.join(" ");
@@ -376,16 +381,18 @@ export class OutboundMirror {
 		if (!this.hub.cfg.activityLive) return;
 		if (!turn.tools.length) return; // a race must never leave an empty board on screen
 		if (this.activity.isSealed(chatId)) return; // that turn's board is already history
+		const lang = this.hub.lang(chatId);
 		const running = turn.tools.filter((tool) => tool.durationMs === undefined);
 		const failed = turn.tools.filter((tool) => tool.isError).length;
 		const head = [
-			`🔧 <b>이번 턴</b> · ${turn.tools.length}회`,
-			failed ? `❌ ${failed}개 실패` : "",
-			running.length ? `<i>진행 중… ${escapeHtml(formatDuration(Date.now() - turn.startedAt))}</i>` : "",
+			pick(lang, `🔧 <b>이번 턴</b> · ${turn.tools.length}회`, `🔧 <b>this turn</b> · ${turn.tools.length} tool${turn.tools.length === 1 ? "" : "s"}`),
+			failed ? pick(lang, `❌ ${failed}개 실패`, `❌ ${failed} failed`) : "",
+			running.length ? pick(lang, `<i>진행 중… ${escapeHtml(formatDuration(Date.now() - turn.startedAt))}</i>`, `<i>running… ${escapeHtml(formatDuration(Date.now() - turn.startedAt))}</i>`) : "",
 		];
 		const shown = turn.tools.slice(-BOARD_LINES);
 		const lines = [head.filter(Boolean).join(" ")];
-		if (turn.tools.length > shown.length) lines.push(`· …그 이전 ${turn.tools.length - shown.length}회는 접었어요`);
+		if (turn.tools.length > shown.length)
+			lines.push(pick(lang, `· …그 이전 ${turn.tools.length - shown.length}회는 접었어요`, `· …${turn.tools.length - shown.length} earlier calls folded`));
 		for (const tool of shown) {
 			const mark = tool.isError ? "❌" : tool.durationMs === undefined ? "⚙️" : iconFor(tool.name);
 			lines.push(`${mark} <code>${escapeHtml(tool.name)}</code> ${escapeHtml(truncate(tool.detail, 120))}`);
@@ -399,11 +406,13 @@ export class OutboundMirror {
 	 * stopped inside a call). Without this the board keeps reading “진행 중…” with a ⚙️ on a call that
 	 * will never return.
 	 */
-	private async sealBoards(tail: string): Promise<void> {
+	private async sealBoards(aborted: boolean): Promise<void> {
 		if (this.verbosity() !== 1 || !this.hub.cfg.activityLive) return;
 		for (const [chatId, turn] of this.turns) {
 			if (!turn.tools.length) continue;
-			await this.activity.finalize(chatId, this.summaryHtml(turn, tail));
+			const lang = this.hub.lang(chatId);
+			const tail = aborted ? pick(lang, "⛔ 중단됨", "⛔ stopped") : pick(lang, "⚠️ 턴이 끝까지 가지 못했어요", "⚠️ the turn never finished");
+			await this.activity.finalize(chatId, this.summaryHtml(turn, lang, tail));
 		}
 	}
 
@@ -462,16 +471,18 @@ function roleOf(message: unknown): string {
  * A model call that ended badly (bad key, rate limit, overflow, truncated at max tokens).
  * pi prints these in the terminal; without them Telegram just looks dead, so mirror them.
  */
-function failureLine(message: unknown): string | undefined {
+function failureLine(message: unknown): Localized | undefined {
 	const record = message as { stopReason?: string; errorMessage?: string } | undefined;
 	if (!record || roleOf(record) !== "assistant") return undefined;
 	const error = typeof record.errorMessage === "string" ? record.errorMessage.trim() : "";
 	if (record.stopReason === "error" || error) {
-		const detail = error || "알 수 없는 오류로 모델 응답이 끊겼어요.";
-		return `❌ <i>${escapeHtml(truncate(redactSecrets(detail), 900))}</i>`;
+		return (lang) => `❌ <i>${escapeHtml(truncate(redactSecrets(error || pick(lang, "알 수 없는 오류로 모델 응답이 끊겼어요.", "an unknown error ended the model's reply")), 900))}</i>`;
 	}
 	if (record.stopReason === "length") {
-		return "⚠️ <i>max tokens에 도달해서 답이 잘렸어요. 터미널에서 /model 로 context window 큰 모델을 고르거나 답을 나눠 요청해요.</i>";
+		return L(
+			"⚠️ <i>max tokens에 도달해서 답이 잘렸어요. 터미널에서 /model 로 context window 큰 모델을 고르거나 답을 나눠 요청해요.</i>",
+			"⚠️ <i>the answer was cut off at the token limit. Pick a model with a bigger context window with /model in the terminal, or ask for the answer in parts.</i>",
+		);
 	}
 	return undefined;
 }

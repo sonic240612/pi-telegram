@@ -141,7 +141,9 @@ export interface Hub {
 	setLang(chatId: number, lang: Lang | undefined): void;
 	/** Why that language: the chat's own choice, the config file, telegram's client language, or the fallback. */
 	langSource(chatId: number): "chat" | "config" | "telegram" | "default";
-	sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: string): Promise<void>;
+	/** Language for output that belongs to no single chat — pi's terminal, mostly. */
+	defaultLang(): Lang;
+	sendFile(chatId: number, data: Uint8Array, fileName: string, caption?: Localized): Promise<void>;
 	broadcastFile(data: Uint8Array, fileName: string, caption?: string): Promise<void>;
 	editKeyboard(chatId: number, messageId: number, text: string, rows: TgInlineKeyboardButton[][]): Promise<boolean>;
 	/** Take the buttons off a message we no longer have actions for. */
@@ -158,12 +160,12 @@ export interface Hub {
 	 * /new, /resume and /fork dispose the pi session and re-create the extension, so the instance
 	 * that ran the action cannot confirm it.
 	 */
-	notifyAfterRestart(text: string): number;
+	notifyAfterRestart(notice: Localized): number;
 	clearPendingNotice(at?: number): void;
 	sendToPi(text: string, options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean }): void;
 	isIdle(): boolean;
 	abortRun(): void;
-	compactRun(instructions?: string): { ok: boolean; error?: string };
+	compactRun(instructions?: string): { ok: boolean; error?: Localized };
 	setSessionName(name: string): void;
 	sessionName(): string | undefined;
 	currentModelKey(): string | undefined;
@@ -176,9 +178,9 @@ export interface Hub {
 	searchModels(text: string, limit: number): ModelLike[];
 	/** Providers with their model counts, for drilling into a big provider. */
 	modelProviders(): { provider: string; count: number; local: boolean; needsAuth: boolean }[];
-	setModelByKey(key: string): Promise<{ ok: boolean; error?: string; resolved?: string; custom?: { id: string; template: string } }>;
+	setModelByKey(key: string): Promise<{ ok: boolean; error?: Localized; resolved?: string; custom?: { id: string; template: string } }>;
 	thinkingLevel(): string;
-	setThinkingLevel(level: string): { ok: boolean; error?: string };
+	setThinkingLevel(level: string): { ok: boolean; error?: Localized };
 	listTools(): { name: string; active: boolean; description?: string }[];
 	setActiveTools(names: string[]): void;
 	listCommands(): PiCommandLike[];
@@ -193,7 +195,7 @@ export interface Hub {
 	 * Fold a tool result into the goal view (pi-goal-x interop). Returns chat HTML when the change is
 	 * news — a new goal, a status change, or task progress — and nothing for bookkeeping mutations.
 	 */
-	observeGoal(result: unknown): string | undefined;
+	observeGoal(result: unknown): Localized | undefined;
 	/** What the bridge knows about the goal this session is chasing. */
 	goalState(): { goal?: GoalSnapshot; focus?: FocusState };
 	uptimeMs(): number;
