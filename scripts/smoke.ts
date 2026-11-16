@@ -21,7 +21,7 @@ import { draftHtml, mdToHtml, toHtmlChunks } from "../src/format.ts";
 import { TelegramBot } from "../src/telegram.ts";
 import { langFromTelegramCode } from "../src/i18n.ts";
 import { inheritedLanguage } from "../src/config.ts";
-import { claim, readState, release, shouldTakeOver, type BridgeOwner } from "../src/lease.ts";
+import { claim, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, processMissing, readState, release, shouldTakeOver, type BridgeOwner } from "../src/lease.ts";
 
 // ── isolated pi dir + workspace before any project import ──────────────────────────
 const agentDir = mkdtempSync(join(tmpdir(), "pi-tg-agent-"));
@@ -1975,10 +1975,11 @@ const leasePath = join(agentDir, "telegram-lease.json");
 const flat = (path: string) => readFileSync(path, "utf8").replace(/\s+/g, " ").slice(0, 200);
 check("a connected bridge writes down that it owns the bridge", existsSync(leasePath) && readFileSync(leasePath, "utf8").includes(String(process.pid)), existsSync(leasePath) ? flat(leasePath) : "no lease file");
 const foreignLease = (alive: boolean) => {
-	const at = alive ? Date.now() : Date.now() - 120_000;
+	const at = alive ? Date.now() : Date.now() - 10 * 60_000;
+	const who = { owner: "pi-4242@another-machine", token: "tok-foreign", pid: 4242, host: "another-machine", cwd: "C:/other", label: "laptop window", since: at, heartbeat: at };
 	return JSON.stringify({
-		bridge: { owner: "pi-4242", pid: 4242, host: "another-machine", cwd: "C:/other", label: "laptop window", since: at, heartbeat: at },
-		sessions: [{ owner: "pi-4242", pid: 4242, host: "another-machine", cwd: "C:/other", label: "laptop window", since: at, heartbeat: at, connected: true, holding: true }],
+		bridge: who,
+		sessions: [{ ...who, connected: true, holding: true }],
 		released: undefined,
 	});
 };
@@ -1997,7 +1998,7 @@ check(
 	writeFileSync(leasePath, foreignLease(true));
 	const handoverSeen = await settle(
 		"a window that loses the bridge to another window notices it",
-		() => notices.slice(handoverNotices).some((n) => /another pi session took|다른 pi 세션이 브리지를/i.test(n.message)),
+		() => notices.slice(handoverNotices).some((n) => /another pi window took|다른 pi 창이 이 봇을/i.test(n.message)),
 		25_000,
 	);
 	await sleep(1200);
@@ -2005,6 +2006,20 @@ check(
 	await sleep(1500);
 	const updatesAfterHandover = calls.filter((call) => call.method === "getUpdates").length;
 	check("and stops polling rather than fighting over the token", handoverSeen && updatesAfterHandover === quietWindow, `${quietWindow} -> ${updatesAfterHandover} of ${updatesBeforeHandover} | ${notices.slice(handoverNotices).map((n) => n.message).join(" | ").slice(0, 150)}`);
+
+// The other window goes away (its heartbeat is ten minutes old). Nothing should grab the bridge
+// behind a person's back: a window that stood down stays down until they say otherwise.
+writeFileSync(leasePath, foreignLease(false));
+const meBeforeDead = calls.filter((call) => call.method === "getMe").length;
+const sendsBeforeDead = calls.filter((call) => call.method === "sendMessage").length;
+await sleep(LEASE_HEARTBEAT_MS + 2500);
+check(
+	"a waiting window does not take the bridge just because the holder died",
+	readState(leasePath).bridge === null &&
+		calls.filter((call) => call.method === "getMe").length === meBeforeDead &&
+		calls.filter((call) => call.method === "sendMessage").length === sendsBeforeDead,
+	flat(leasePath),
+);
 
 // An explicit `on` here means take it back, and the roster follows whoever is actually polling.
 const meCalls = calls.filter((call) => call.method === "getMe").length;
@@ -2019,6 +2034,19 @@ check(
 	notices.filter((n) => n.message.includes("telegram bridge:")).at(-1)?.message.slice(0, 160) ?? "",
 );
 check("and that window is connected", /connected as @/i.test(notices.map((n) => n.message).join("\n")), notices.slice(-4).map((n) => n.message).join(" | ").slice(0, 160));
+
+// A short-lived pi (an updater, an agent window) can claim the lease and quit. The window a person
+// is using takes itself back rather than disconnecting over a session that no longer exists.
+const stopsBeforeSteal = textMessages("bridge stopped").length;
+const updatesBeforeSteal = calls.filter((call) => call.method === "getUpdates").length;
+writeFileSync(leasePath, foreignLease(false));
+await sleep(LEASE_HEARTBEAT_MS + 2500);
+check("a window whose lease was taken by something that already exited takes it back", readFileSync(leasePath, "utf8").includes(String(process.pid)), flat(leasePath));
+check(
+	"and it keeps polling instead of dropping the person's session",
+	textMessages("bridge stopped").length === stopsBeforeSteal && calls.filter((call) => call.method === "getUpdates").length > updatesBeforeSteal,
+	`${textMessages("bridge stopped").length - stopsBeforeSteal} stop notices`,
+);
 
 // Turning it off in this session releases the lease, and says a human asked for it: waiting windows
 // leave it alone for a while rather than snatching the phone back.
@@ -2047,7 +2075,7 @@ const windowA: BridgeOwner = { owner: "pi-11@desk", token: "tok-a", pid: 11, hos
 const windowB: BridgeOwner = { owner: "pi-22@laptop", token: "tok-b", pid: 22, host: "laptop", cwd: "C:/b", label: "laptop window", since: Date.now(), heartbeat: Date.now() };
 writeFileSync(rulePath, JSON.stringify({ bridge: windowB, sessions: [], released: undefined }));
 check("a window that is polling keeps the bridge", claim(rulePath, windowA).ok === false && readFileSync(rulePath, "utf8").includes("pi-22@laptop"), flat(rulePath));
-writeFileSync(rulePath, JSON.stringify({ bridge: { ...windowB, heartbeat: Date.now() - 120_000 }, sessions: [], released: undefined }));
+writeFileSync(rulePath, JSON.stringify({ bridge: { ...windowB, heartbeat: Date.now() - (LEASE_TTL_MS + 60_000) }, sessions: [], released: undefined }));
 check("a window that died stops owning it", claim(rulePath, windowA).ok === true && readFileSync(rulePath, "utf8").includes("pi-11@desk"), flat(rulePath));
 writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: false } }));
 check("a window switched off by hand is not snatched back a moment later", shouldTakeOver(rulePath, windowB) === false);
@@ -2065,6 +2093,20 @@ const deadPid = (() => {
 })();
 writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: `pi-${deadPid}@${hostname()}`, pid: deadPid, host: hostname(), at: Date.now(), shutdown: false } }));
 check("a window that switched off and then died stops holding anybody else back", shouldTakeOver(rulePath, windowB) === true, `dead pid ${deadPid}`);
+
+// Is a window still running? That is the operating system's answer, not a guess: a process we are
+// not allowed to look at is alive, and only one the OS cannot find is gone.
+const privatePid = [4, 1, process.pid].find((pid) => !processMissing(pid)) ?? 0;
+writeFileSync(
+	rulePath,
+	JSON.stringify({ bridge: { owner: `pi-${privatePid}@${hostname()}`, token: "tok-private", pid: privatePid, host: hostname(), cwd: "C:/windows", label: "protected", since: Date.now(), heartbeat: Date.now() }, sessions: [], released: undefined }),
+);
+check("a process we are not allowed to inspect still counts as running", claim(rulePath, windowA).ok === false, `pid ${privatePid} | ${flat(rulePath)}`);
+writeFileSync(
+	rulePath,
+	JSON.stringify({ bridge: { owner: `pi-${deadPid}@${hostname()}`, token: "tok-dead", pid: deadPid, host: hostname(), cwd: "C:/gone", label: "crashed", since: Date.now(), heartbeat: Date.now() }, sessions: [], released: undefined }),
+);
+check("and a window the operating system cannot find is gone, however fresh its last word", claim(rulePath, windowA).ok === true, `pid ${deadPid} | ${flat(rulePath)}`);
 writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: false } }));
 writeFileSync(rulePath, JSON.stringify({ bridge: null, sessions: [], released: { by: "pi-11@desk", pid: 11, host: "desk", at: Date.now(), shutdown: true } }));
 check("a window that closed hands the bridge over at once", shouldTakeOver(rulePath, windowB) === true);

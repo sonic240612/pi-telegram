@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { configPath, loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
-import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, shouldTakeOver, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
+import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
 import { GoalView, type FocusState, type GoalSnapshot } from "./goal.ts";
@@ -809,14 +809,24 @@ export class TelegramBridge implements Hub {
 		if (this.bot) {
 			const state = beat(this.leaseFile, this.me, true);
 			if (state.mine) return;
-			// Another window took it. Polling against it only trades 409s, so disconnect and wait.
+			if (!state.holder) {
+				// Nobody live holds it — the record was replaced by something that has already exited (a
+				// short-lived pi that started, claimed and quit), or cleared while this window was busy. The
+				// person is still talking to this window, so take ourselves back rather than disconnect.
+				this.dbg("lease taken over by something that is not running, reclaiming", state.gone ? state.gone.owner : "an empty lease");
+				claim(this.leaseFile, this.me, true);
+				this.holdsBridge = true;
+				return;
+			}
+			// A live window has it, which now only happens when a person asked for it there. Polling
+			// against it only trades 409s, so this window lets go and says who took it.
 			this.holdsBridge = false;
 			this.notifyUi(
 				this.eventCtx,
 				pick(
 					this.defaultLang(),
-					`telegram: 다른 pi 세션이 브리지를 가져갔어요 — 이 창은 연결을 끊어요 (${state.holder ? describeOwner(state.holder) : "?"}) · /telegram on 으로 되찾기`,
-					`telegram: another pi session took this bridge — disconnecting this window (${state.holder ? describeOwner(state.holder) : "?"}) · /telegram on takes it back`,
+					`telegram: 다른 pi 창이 이 봇을 가져갔어요 (${state.holder ? describeOwner(state.holder) : "?"} · 그 창에서 /telegram on을 누른 것) — 이 창은 연결을 끊어요 · 여기서 /telegram on으로 되찾기`,
+					`telegram: another pi window took this bot (${state.holder ? describeOwner(state.holder) : "?"} — someone typed /telegram on there) — disconnecting this window · /telegram on here takes it back`,
 				),
 				"warning",
 			);
@@ -824,25 +834,10 @@ export class TelegramBridge implements Hub {
 			this.startLeaseTick();
 			return;
 		}
-		if (this.disabled || this.userTurnedOff || !resolveToken(this.cfg)) {
-			beat(this.leaseFile, this.me, false);
-			return;
-		}
-		const orphan = readState(this.leaseFile).bridge;
-		if (!shouldTakeOver(this.leaseFile, this.me)) {
-			beat(this.leaseFile, this.me, false);
-			return;
-		}
-		this.notifyUi(
-			this.eventCtx,
-			pick(
-				this.defaultLang(),
-				`telegram: 브리지를 쓰고 있던 pi 세션이 사라져서 이 세션이 이어받아요${orphan ? ` (${describeOwner(orphan)})` : ""}`,
-				`telegram: the session that held this bridge is gone, so this one takes over${orphan ? ` (${describeOwner(orphan)})` : ""}`,
-			),
-			"warning",
-		);
-		await this.start({ force: false }).catch(() => undefined);
+		// Not connected. Stay on the roster and keep answering /telegram who, but never reach for the
+		// bridge by ourselves: not when the holder dies, not when the hold expires. Which window talks to
+		// the phone is the person's call — /telegram on, or opening a session while the bridge is free.
+		beat(this.leaseFile, this.me, false);
 	}
 
 	/** Put the lease back, when we are the one holding it. */
@@ -953,7 +948,14 @@ export class TelegramBridge implements Hub {
 					// Usually means another pi window started polling: hand the lease over instead of
 					// warning forever. If the lease says this window still owns it, the other poller is
 					// something outside pi, and one warning a minute is enough to notice it.
-					if (beat(this.leaseFile, this.me, true).mine) {
+					const seen = beat(this.leaseFile, this.me, true);
+					if (seen.mine || !seen.holder) {
+						if (!seen.mine && !seen.holder) {
+							// The window that took our lease is no longer running: take it back and keep polling.
+							this.dbg("409: lease held by something that is gone, reclaiming", seen.gone ? seen.gone.owner : "an empty lease");
+							claim(this.leaseFile, this.me, true);
+							this.holdsBridge = true;
+						}
 						if (Date.now() - this.conflictWarnAt > 60_000) {
 							this.conflictWarnAt = Date.now();
 							this.notifyUi(
@@ -970,7 +972,11 @@ export class TelegramBridge implements Hub {
 						this.holdsBridge = false;
 						this.notifyUi(
 							this.eventCtx,
-							pick(this.defaultLang(), "telegram: 다른 pi 세션이 이 브리지를 가져갔어요 — 이 창은 연결을 끊어요 · /telegram on 으로 되찾기", "telegram: another pi session took this bridge — disconnecting this window · /telegram on takes it back"),
+							pick(
+								this.defaultLang(),
+								"telegram: 409 충돌 — 다른 pi 창이 이 봇을 polling 중이에요 (그 창에서 /telegram on을 누른 경우) — 이 창은 연결을 끊어요 · 여기서 /telegram on으로 되찾기",
+								"telegram: 409 conflict — another pi window is polling this bot (someone typed /telegram on there) — disconnecting this window · /telegram on here takes it back",
+							),
 							"warning",
 						);
 						await this.stop(undefined, true);

@@ -16,9 +16,12 @@ import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
 
 /** A live session renews its lease this often. */
-export const LEASE_HEARTBEAT_MS = 15_000;
-/** Silence this long means the window is gone (crash, kill, machine asleep). */
-export const LEASE_TTL_MS = 45_000;
+export const LEASE_HEARTBEAT_MS = 10_000;
+/**
+ * Silence this long means the window is gone. Generous on purpose: a window that is merely busy, or a
+ * laptop that was closed for a minute, must not lose the bridge the person is actually using.
+ */
+export const LEASE_TTL_MS = 120_000;
 /** After somebody turns a session off on purpose, wait this long before a waiting session takes over. */
 export const LEASE_RELEASE_HOLD_MS = 5 * 60_000;
 
@@ -65,17 +68,23 @@ export function emptyState(): BridgeState {
 /** A lease is only worth as much as the process behind it. */
 export function holderAlive(owner: BridgeOwner, now = Date.now()): boolean {
 	if (now - owner.heartbeat > LEASE_TTL_MS) return false;
-	// Same machine: the process table is the truth, and a killed pi stops counting immediately.
-	if (owner.host === hostname()) {
-		try {
-			process.kill(owner.pid, 0);
-			return true;
-		} catch {
-			return false;
-		}
-	}
+	// Same machine: a process the OS says does not exist is gone. Anything else — including "you are not
+	// allowed to look at that process" — means it is running, and guessing otherwise would let one window
+	// steal the phone out of another person's session.
+	if (owner.host === hostname()) return !processMissing(owner.pid);
 	// Another machine — nothing local to check, so the heartbeat is all there is.
 	return true;
+}
+
+/** ESRCH is the only answer that proves a process is gone. EPERM means it is there, just private. */
+export function processMissing(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return true;
+	try {
+		process.kill(pid, 0);
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
 }
 
 export function readState(path: string): BridgeState {
@@ -144,16 +153,22 @@ export function release(path: string, me: BridgeOwner, shutdown: boolean): void 
  * Keep the heartbeat line honest, about the bridge and about this session's own place in the list.
  * Returns whether the caller still owns the bridge: someone may have taken it while we were busy.
  */
-export function beat(path: string, me: BridgeOwner, connected: boolean): { mine: boolean; holder: BridgeOwner | null } {
+export function beat(
+	path: string,
+	me: BridgeOwner,
+	connected: boolean,
+): { mine: boolean; holder: BridgeOwner | null; gone: BridgeOwner | null } {
 	const state = readState(path);
 	const now = Date.now();
-	const holder = state.bridge && holderAlive(state.bridge) ? state.bridge : null;
-	const mine = holder ? holder.token === me.token : false;
+	const recorded = state.bridge ?? null;
+	const live = recorded && holderAlive(recorded, now) ? recorded : null;
+	const mine = live ? live.token === me.token : false;
 	me.heartbeat = now;
 	const sessions = state.sessions.filter((s) => !sameWindow(s, me) && now - s.heartbeat < LEASE_TTL_MS);
 	sessions.push({ ...me, connected, holding: mine });
-	writeState(path, { bridge: holder, sessions, released: state.released });
-	return { mine, holder };
+	writeState(path, { bridge: live, sessions, released: state.released });
+	// `gone` matters: a lease held by something that is no longer running is not a rival, it is debris.
+	return { mine, holder: live, gone: recorded && !live ? recorded : null };
 }
 
 /** Free to take? A live holder means no; a session that died mid-session means yes. */
@@ -164,9 +179,12 @@ export function available(path: string): { free: boolean; holder: BridgeOwner | 
 }
 
 /**
- * May a waiting session take the bridge now? Yes when the holder died or closed its window — the
- * phone should keep working without anyone typing. No when a human typed /telegram off: that choice
- * stands until the hold expires.
+ * May a session that is starting up take the bridge? Yes when nobody is holding it, or the holder is
+ * clearly gone. No when a human typed /telegram off: that choice stands until the hold expires.
+ *
+ * Note this is only ever asked by a *starting* session. A window that already stood down never asks
+ * again — if the holder closes, a waiting or switched-off window stays exactly as it was, because the
+ * person decides which window talks to their phone (`/telegram on`).
  */
 export function shouldTakeOver(path: string, me: BridgeOwner, now = Date.now()): boolean {
 	const state = readState(path);

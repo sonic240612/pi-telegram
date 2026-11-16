@@ -282,16 +282,21 @@ Environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ROOT` (Bot API base — used by
   week — and a fresh install follows Telegram. What pi *answers* is never rewritten: the language of
   your prompt and the model decide that, and `/model` can carry an instruction like "answer in Korean"
   (`/resume` brings that back with the session).
-* **One bot token, and only one window polling it.** Open a second pi with the same token and both would
-  poll, so Telegram answers with `409 conflict` and the phone's messages land in whichever window grabs
-  the update first. The bridge settles that before it starts: the first session to arrive takes the
-  bridge, later ones open *disconnected* and say so instead of fighting — `/telegram who` (or `/tg bridge`)
-  lists every window and which one holds it, and each heartbeat is stamped, so when a window is closed or
-  crashes the next one takes over on its own within a few seconds. `/telegram on` takes the bridge over
-  from a window that is still alive, while `/telegram start` and `/telegram restart` connect only when the
-  bridge is free (or already theirs); `/telegram off` lets it go and stays off until you say `on`. A pi that replaces its own session (`/new`, `/resume`, `/fork`,
-  `/reload`) keeps the bridge it already had, and the half-finished bridge it leaves behind cannot hand it
-  to somebody else.
+* **One bot token, and only one window polling it.** Open a second pi with the same token and both
+  would poll, so Telegram answers `409 conflict` and the phone's messages land in whichever window
+  grabs the update first. The bridge settles that before it starts: the first session to arrive takes
+  the bridge, later ones open *disconnected* and say so instead of fighting — `/telegram who` (or
+  `/tg bridge`) lists every window and which one holds it.
+* **The window holding the bridge keeps it until a person moves it.** Nothing takes it over on its own:
+  not when the holder crashes, not when its heartbeat goes quiet. A window that stood down stays down
+  until someone types `/telegram on`. A session that *starts* while the bridge is free does take it —
+  so switching the holder off, closing it, and opening the other window again is how you move the
+  phone. `/telegram start` and `/telegram restart` connect only when the bridge is free or already
+  theirs. A window whose lease is taken by something that has already exited (an updater, an agent
+  window that started and quit) takes itself back rather than dropping the session you are using.
+* **Every pi on the machine loads this extension — including a headless coding-agent window.** Those
+  count as windows in the roster and will take a free bridge. Turn the ones you do not want answering
+  with `/telegram off` in that window, or start them with `pi --telegram-off`.
 * **Compaction is visible.** pi blocks new prompts while it rebuilds its context, and it used to do
   that silently as far as Telegram was concerned. Now the bridge announces it — `🗜 컨텍스트 압축 중…`
   with the context size and what triggered it (`/compact`, the context threshold, or an overflow
