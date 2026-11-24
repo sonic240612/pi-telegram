@@ -5,3 +5,5 @@ node_modules/
 .tg-smoke*/
 .pi/
 tmp/
+# audit notes stay on the machine, not in the public repo
+SECURITY_AUDIT.md
