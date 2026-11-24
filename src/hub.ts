@@ -29,6 +29,8 @@ export type CallbackActionKind =
 	| "list:page"
 	| "menu:open"
 	| "chat:unpair"
+	| "shell:confirm"
+	| "shell:cancel"
 	| "ask:answer"
 	| "askq:option"
 	| "askq:multi"

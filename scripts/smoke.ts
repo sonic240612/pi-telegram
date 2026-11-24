@@ -14,13 +14,13 @@
  * config persistence and file permissions.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, existsSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, existsSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftHtml, mdToHtml, toHtmlChunks } from "../src/format.ts";
 import { TelegramBot } from "../src/telegram.ts";
 import { langFromTelegramCode } from "../src/i18n.ts";
-import { inheritedLanguage } from "../src/config.ts";
+import { inheritedLanguage, winAclArgs } from "../src/config.ts";
 import { claim, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, processMissing, readState, release, shouldTakeOver, type BridgeOwner } from "../src/lease.ts";
 
 // ── isolated pi dir + workspace before any project import ──────────────────────────
@@ -150,10 +150,12 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
 			}
 		} else if (contentType.includes("multipart/form-data")) {
 			const text = raw.toString("latin1");
+			const textUtf8 = raw.toString("utf8"); // captions are text; latin1 garbles them
 			params = {
 				chat_id: Number(/name="chat_id"\r\n\r\n(-?\d+)/.exec(text)?.[1] ?? 0),
 				file_name: /name="(?:document|photo)"; filename="([^"]*)"/.exec(text)?.[1],
-				caption: /name="caption"\r\n\r\n([^\r]*)/.exec(text)?.[1],
+				file_body: /name="(?:document|photo)"; filename="[^"]*"\r\n\r\n([\s\S]*?)\r\n--/.exec(text)?.[1],
+				caption: /name="caption"\r\n\r\n([^\r]*)/.exec(textUtf8)?.[1],
 			};
 		}
 		calls.push({ method, params });
@@ -920,9 +922,59 @@ await waitFor("bash executed", () => execCalls.length > 0);
 check("/bash runs through pi exec", execCalls[0].args.join(" ").includes("echo hello from tg"), JSON.stringify(execCalls[0]));
 await waitFor("bash output", () => textMessages("executed").length > 0);
 check("/bash returns output and exit code", textMessages("✅ exit 0").length > 0);
+
+// A command that looks like it destroys something waits for a tap before it runs.
+const execBeforeRisk = execCalls.length;
+pushMessage(CHAT, "/bash rm -rf /somewhere/important");
+const askedToConfirm = await settle("a destructive /bash asks first", () => textMessages("확인 필요").length > 0, 8_000);
+check("a destructive /bash asks before running", askedToConfirm);
+check("and nothing ran while it waited", execCalls.length === execBeforeRisk, JSON.stringify(execCalls.slice(execBeforeRisk)));
+const riskCall = textMessages("확인 필요").at(-1);
+const riskButtons = keyboardOf(riskCall).flat();
+check(
+	"the confirmation offers a run button and a cancel button",
+	riskButtons.some((button) => button.text.includes("실행")) && riskButtons.some((button) => button.text.includes("취소")),
+	JSON.stringify(riskButtons),
+);
+const runButton = riskButtons.find((button) => button.text.includes("실행"));
+if (runButton) {
+	pushCallback(CHAT, Number(riskCall?.params.message_id ?? 0), runButton.callback_data);
+	const ranAfterConfirm = await settle("confirming runs the command", () => execCalls.length > execBeforeRisk, 12_000);
+	check("confirming on the phone runs exactly that command", ranAfterConfirm, JSON.stringify(execCalls.slice(execBeforeRisk)));
+}
+
+// allowShell in telegram.json closes the door, and an edit takes effect without restarting pi.
+const cfgOnDisk = () => JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+const writeCfg = (cfg: Record<string, unknown>) => writeFileSync(configPath, JSON.stringify(cfg));
+const cfgOff = cfgOnDisk();
+cfgOff.allowShell = false;
+writeCfg(cfgOff);
+await sleep(1_700);
+const execBeforeOff = execCalls.length;
+pushMessage(CHAT, "/bash echo blocked here");
+const shellRefused = await settle("with allowShell off /bash refuses", () => textMessages("명령 실행이 꺼져 있어요").length > 0, 8_000);
+check("with allowShell off /bash refuses", shellRefused);
+check("and a hand-edited switch takes effect without restarting pi", execCalls.length === execBeforeOff, JSON.stringify(execCalls.slice(execBeforeOff)));
+const cfgBack = cfgOnDisk();
+cfgBack.allowShell = true;
+writeCfg(cfgBack);
+await sleep(1_700);
+
+appendFileSync(currentSessionFile, '{"role":"user","text":"my api key is sk-abcdefghijklmnopqrstuvwxyz01"}\n');
 pushMessage(CHAT, "/export");
 await waitFor("export sent", () => calls.some((call) => call.method === "sendDocument"));
 check("/export sends the session file", true);
+	const exported = calls.filter((call) => call.method === "sendDocument").at(-1);
+	check(
+		"/export masks credential-looking strings in the transcript it sends",
+		!String(exported?.params.file_body ?? "").includes("sk-abcdefghijklmnopqrstuvwxyz01"),
+		String(exported?.params.file_body ?? "(no body captured)").slice(-120),
+	);
+	check(
+		"and the caption says the copy was masked",
+		/가렸어요|masked/.test(String(exported?.params.caption ?? "")),
+		String(exported?.params.caption ?? "").slice(0, 160),
+	);
 idle = false;
 pushMessage(CHAT, "/compact while busy");
 await waitFor("compact refused while running", () => textMessages("실행 중에는 압축할 수 없어요").length > 0);
@@ -953,8 +1005,19 @@ pushMessage(CHAT, "what is in this photo", { photo: [{ file_id: "photo1", width:
 await waitFor("image delivered to pi", () => userMessages.some((entry) => Array.isArray(entry.content) && (entry.content as { type: string }[]).some((part) => part.type === "image")));
 const imagePart = (userMessages.map((entry) => entry.content).filter((content) => Array.isArray(content)).flat() as { type: string; data?: string; mimeType?: string }[]).find((part) => part.type === "image");
 check("photo becomes image content with real bytes", imagePart?.mimeType === "image/jpeg" && Buffer.from(imagePart?.data ?? "", "base64").length === jpegBytes.length, `${imagePart?.mimeType} ${imagePart?.data?.length}`);
+const promptsBeforeAttachment = userMessages.length;
 pushMessage(CHAT, "read this file", { document: { file_id: "doc1", file_name: "notes.md", mime_type: "text/markdown", file_size: 30 } });
 await waitFor("text document inlined", () => promptText().includes("Attached file from Telegram: notes.md"));
+	check(
+		"a caption plus a text file is one prompt, not two turns",
+		userMessages.length === promptsBeforeAttachment + 1,
+		`+${userMessages.length - promptsBeforeAttachment} prompts`,
+	);
+	check(
+		"and that prompt carries both the caption and the file body",
+		promptText().includes("read this file") && promptText().includes("Attached file from Telegram: notes.md"),
+		promptText().slice(-160),
+	);
 check("text document inlined as a prompt", promptText().includes("```"), promptText().slice(-160));
 pushMessage(CHAT, "here is an archive", { document: { file_id: "bin1", file_name: "app.zip", mime_type: "application/zip", file_size: 900 } });
 await waitFor("unsupported attachment notice", () => textMessages("첨부한 파일을 읽을 수 없어요").length > 0, 12_000);
@@ -1958,6 +2021,59 @@ try {
 }
 process.env.TELEGRAM_API_ROOT = savedRoot;
 check("TELEGRAM_API_ROOT cannot point at a plain-http third-party host", /must be https/.test(refused), refused.slice(0, 140));
+
+// A group is not a private line: every member would see the pairing code.
+const GROUP = 555000777;
+const pairingPromptsBefore = textMessages("pairing 필요").length;
+pushMessage(GROUP, "hello room", { chat: { id: GROUP, type: "supergroup", title: "Team room" } });
+const groupRefused = await settle("a group chat is refused by default", () => textMessages("그룹 채팅은 받지 않아요").length > 0, 10_000);
+check("a group chat is refused by default", groupRefused);
+check("and the group is never invited to pair", textMessages("pairing 필요").length === pairingPromptsBefore, `+${textMessages("pairing 필요").length - pairingPromptsBefore}`);
+
+// With groups allowed on purpose, the room is paired to one account: only that one speaks to pi.
+const cfgGroups = cfgOnDisk();
+cfgGroups.allowGroups = true;
+writeCfg(cfgGroups);
+await sleep(1_700);
+pushMessage(GROUP, "pair this room", { chat: { id: GROUP, type: "supergroup", title: "Team room" }, from: { id: 900, first_name: "Tester", language_code: "ko" } });
+await waitFor("the group gets a pairing prompt", () => sentMessages("pairing 필요").some((call) => Number(call.params.chat_id) === GROUP), 10_000);
+const groupCode = /code (\d{4,6})/.exec(notices.filter((n) => n.message.includes("pairing request")).at(-1)?.message ?? "")?.[1];
+commandHandlers.get("telegram-pair")?.(groupCode ?? "", ctx);
+await waitFor("the group is paired", () => readFileSync(configPath, "utf8").includes(String(GROUP)), 10_000);
+check("an allowed group can be paired", readFileSync(configPath, "utf8").includes(String(GROUP)));
+await waitFor("the paired group's own message reaches pi", () => promptText().includes("pair this room"), 12_000);
+const promptsBeforeGuest = userMessages.length;
+pushMessage(GROUP, "pi, do something for the room", {
+	chat: { id: GROUP, type: "supergroup", title: "Team room" },
+	from: { id: 901, first_name: "Guest", language_code: "ko" },
+});
+await sleep(2_500);
+check("a guest in an allowed group does not reach pi", userMessages.length === promptsBeforeGuest, `+${userMessages.length - promptsBeforeGuest} prompts`);
+pushMessage(GROUP, "pi, from the account that paired this room", {
+	chat: { id: GROUP, type: "supergroup", title: "Team room" },
+	from: { id: 900, first_name: "Tester", language_code: "ko" },
+});
+const ownerReached = await settle("the owner of the group reaches pi", () => promptText().includes("pi, from the account that paired this room"), 12_000);
+check("the account that paired the group does reach pi", ownerReached);
+
+// And the pairing code belongs to the account that asked for it.
+const GUEST2 = 555000888;
+pushMessage(GUEST2, "let me in");
+await waitFor("second chat asks for pairing", () => sentMessages("pairing 필요").some((call) => Number(call.params.chat_id) === GUEST2), 10_000);
+const secondCode = /code (\d{4,6})/.exec(notices.filter((n) => n.message.includes("pairing request")).at(-1)?.message ?? "")?.[1];
+pushMessage(GUEST2, secondCode ?? "000000", { from: { id: 4242, first_name: "Somebody else", language_code: "ko" } });
+const wrongAccountRefused = await settle("a code typed by another account is refused", () => textMessages("코드를 요청한 텔레그램 계정이").length > 0, 10_000);
+check("a pairing code typed by a different account does not pair the chat", wrongAccountRefused);
+check("and that chat is still not paired", !readFileSync(configPath, "utf8").includes(String(GUEST2)), readFileSync(configPath, "utf8").slice(0, 80));
+
+
+// Windows keeps the token file behind ACLs, not chmod, so assert the calls it would make.
+const aclCalls = winAclArgs("C:/users/me/.pi/agent/telegram.json", "desk\\me");
+check(
+	"on windows the token file is reset to one account, not inherited rights",
+	JSON.stringify(aclCalls) === JSON.stringify([["C:/users/me/.pi/agent/telegram.json", "/grant:r", "desk\\me:F"], ["C:/users/me/.pi/agent/telegram.json", "/inheritance:r"]]),
+	JSON.stringify(aclCalls),
+);
 
 if (process.platform !== "win32") {
 	const mode = statSync(configPath).mode;

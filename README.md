@@ -60,7 +60,14 @@ Updates: `pi update --extensions` re-syncs a git install, then restart pi (or `/
    ```
 
 The code is never sent to the unapproved chat, and an unapproved chat gets only the pairing notice.
-Five wrong guesses rotate the code, cool that chat down and tell you in the pi terminal.
+Five wrong guesses rotate the code, cool that chat down and tell you in the pi terminal. A code typed
+by a different Telegram account than the one that asked is refused, and the pi terminal names the
+account that asked.
+
+Group chats are refused by default: everyone in a room would see the pairing code, and pairing a room
+would hand pi, `/bash` and the machine to every member. Set `allowGroups: true` in `telegram.json` to
+open them; even then only the one account that paired the room can reach pi, and anyone else who types
+gets a short notice instead of a prompt.
 
 ## Using it from Telegram
 
@@ -86,7 +93,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/tree` | pick from keyboard | Move to another node of the session tree. |
 | `/rename` `<name>` | new name, e.g. `/rename auth refactor` | Rename the session. `/name` is an alias. |
 | `/compact` `[instructions]` | e.g. `/compact keep the test failures` | Context compaction. Refused while a run is in flight (`/abort` first). The chat is told when pi compacts — see “Compaction is visible”. |
-| `/export` | — | Send the session `.jsonl` file to the chat. |
+| `/export` | — | Send the session `.jsonl` file to the chat. Credential-looking strings are masked in the copy unless `redactOnExport` is off; the caption says which you got. |
 | `/usage` | — | Context window usage: tokens, window size, percent. |
 | `/status` (alias `/session`) | — | Bot, model, thinking level, session name/file, cwd, uptime, pending chats, verbosity, streaming. |
 
@@ -109,7 +116,7 @@ text files (`.ts`, `.md`, `.json`, …) are inlined, other attachments get an ex
 | `/abort` (aliases `/stop`, `/cancel`) | — | Abort the current run. No-op while idle (says so). |
 | `/steer <text>` | instruction | Inject an instruction into the running turn. |
 | `/queue <text>` (alias `/followup`) | instruction | Deliver after the current run finishes. |
-| `/bash <command>` | shell command | Runs in the session cwd. Output over ~3000 chars arrives as a `.txt` file. |
+| `/bash <command>` | shell command | Runs in the session cwd. Output over ~3000 chars arrives as a `.txt` file. Commands that look hard to undo (`rm -rf`, `del /s`, force push, `curl … \| sh`, disk writes) stop and ask for a tap on the phone first; `allowShell: false` turns the whole thing off. |
 | `/reload` | — | Reload extensions (pi runtime restart, bridge reconnects). |
 
 ### Output control
@@ -263,7 +270,13 @@ want the tool available at all — remove it from pi's tool list if you do not.
 | `announce` | connect/disconnect notices |
 | `redactBash` | scrub credential-looking text out of `/bash` output the bridge copies to Telegram (default `true`) |
 | `redactTranscript` | also scrub the mirrored transcript (default `false` — detail mode should match the terminal) |
+| `redactOnExport` | mask credential-looking strings in the transcript `/export` sends (default `true`) |
+| `allowShell` | whether `/bash` may run anything at all (default `true`) |
+| `allowGroups` | whether group chats may pair and speak (default `false`; when on, only the account that paired a room reaches pi) |
 | `offset` | last processed Telegram `update_id` (survives restarts, so nothing is replayed) |
+
+These switches are meant to be edited by hand, and an edit takes effect the next time the bridge hears
+from a chat — no pi restart, and the bridge will not overwrite your edit when it saves chats.
 
 Next to it sits `telegram-lease.json` — coordination, not configuration: which pi window is allowed to
 poll this token, and which windows are merely open. It holds no secrets, and deleting it is harmless

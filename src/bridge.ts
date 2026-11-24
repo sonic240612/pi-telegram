@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { configPath, loadConfig, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
+import { configPath, loadConfig, mergeSwitchesFrom, NOTICE_TTL_MS, resolveToken, saveConfig, writeConfigNow, type TelegramChatRecord, type TelegramConfig } from "./config.ts";
 import { beat, claim, describeOwner, holderAlive, LEASE_HEARTBEAT_MS, LEASE_TTL_MS, readState, release, sameWindow, windowId, type BridgeOwner, type BridgeSession } from "./lease.ts";
 import { CommandLayer, THINKING_LEVELS, TELEGRAM_MENU, errorMessage } from "./commands.ts";
 import { DraftManager } from "./draft.ts";
@@ -105,6 +105,12 @@ export class TelegramBridge implements Hub {
 	private echoes = new Map<string, number>();
 	private pending = new Map<number, PendingChat>();
 	private chatTitles = new Map<number, string>();
+	/** What Telegram says each chat is: private, group, supergroup, channel. Decides who may speak. */
+	private chatTypes = new Map<number, "private" | "group" | "supergroup" | "channel">();
+	/** One-off notices, so a policy refusal does not become a reply to every message. */
+	private lastNotice = new Map<string, number>();
+	/** When telegram.json was last re-read for its switches. */
+	private lastSwitchRead = 0;
 	/** Language Telegram reports for each chat's user, kept even before that chat is paired. */
 	private seenLang = new Map<number, Lang>();
 
@@ -1054,8 +1060,37 @@ export class TelegramBridge implements Hub {
 		return true;
 	}
 
+	/**
+	 * The switches in telegram.json are meant to be edited by hand, so an edit should not need a pi
+	 * restart. Re-read them when a person does something — not on every poll, and never when the file
+	 * is missing, which would erase the chats this window is serving.
+	 */
+	private refreshSwitches(): void {
+		if (Date.now() - this.lastSwitchRead < 1_500) return;
+		this.lastSwitchRead = Date.now();
+		if (!existsSync(configPath())) return;
+		// Switches only. Chats, offset and the queued notice belong to this window — taking them from
+		// disk would undo work that has not been written yet.
+		mergeSwitchesFrom(this.cfg, loadConfig());
+	}
+
+	/** Chat kind as Telegram last told us, falling back to what the pairing recorded. */
+	private chatKind(chatId: number, message?: TgMessage): "private" | "group" | "supergroup" | "channel" {
+		return message?.chat?.type ?? this.chatTypes.get(chatId) ?? this.cfg.chats.find((chat) => chat.chatId === chatId)?.type ?? "private";
+	}
+
+	/** Say something once in a while, not on every message: a refusal that repeats is a new flood. */
+	private async noticeOnce(chatId: number, key: string, text: Localized, everyMs = 10 * 60_000): Promise<void> {
+		const id = `${chatId}:${key}`;
+		const last = this.lastNotice.get(id) ?? 0;
+		if (Date.now() - last < everyMs) return;
+		this.lastNotice.set(id, Date.now());
+		await this.sendHtml(chatId, text).catch(() => undefined);
+	}
+
 	private rememberChat(message: TgMessage): string {
 		const chatId = message.chat.id;
+		if (message.chat.type) this.chatTypes.set(chatId, message.chat.type);
 		const label = message.chat.title ?? [message.chat.first_name, message.chat.last_name].filter(Boolean).join(" ") ?? message.chat.username ?? `chat ${chatId}`;
 		this.chatTitles.set(chatId, label);
 		this.noteClientLanguage(chatId, message.from?.language_code);
@@ -1079,9 +1114,29 @@ export class TelegramBridge implements Hub {
 	}
 
 	private async handleMessage(message: TgMessage, edited: boolean): Promise<void> {
+		this.refreshSwitches();
 		const chatId = message.chat.id;
 		const label = this.rememberChat(message);
 		const text = (message.text ?? message.caption ?? "").trim();
+
+		// A group is not a private line. Anyone in the room sees the pairing code, and pairing the room
+		// would hand pi, /bash and this machine to every member — so groups are refused unless the
+		// operator turned allowGroups on, and even then only the one account that paired it may speak.
+		const kind = this.chatKind(chatId, message);
+		if (kind !== "private") {
+			if (!this.cfg.allowGroups) {
+				await this.noticeOnce(chatId, "groups-closed", (lang) =>
+					`🔒 <b>${pick(lang, "그룹 채팅은 받지 않아요", "group chats are not accepted")}</b>\n${pick(lang, "이 브리지는 운영자와의 1:1 대화만 사용합니다. 그룹을 열려면 pi에서 <code>telegram.json</code>의 <code>allowGroups</code>를 켜세요.", "this bridge answers the operator's private chat only. To open groups, set <code>allowGroups</code> in <code>telegram.json</code> in pi.")}`,
+				);
+				this.notifyUi(this.eventCtx, `telegram: a ${kind} chat (${chatId}) tried to use the bridge while groups are closed`, "info");
+				return;
+			}
+			const record = this.cfg.chats.find((chat) => chat.chatId === chatId);
+			if (record?.ownerUserId !== undefined && message.from?.id !== undefined && message.from.id !== record.ownerUserId) {
+				await this.noticeOnce(chatId, "group-guest", (lang) => pick(lang, "ℹ️ 이 그룹에서는 브리지를 붙인 사람만 pi에 말할 수 있어요.", "ℹ️ only the account that paired this bridge may speak to pi in this group."));
+				return;
+			}
+		}
 
 		if (!this.isPaired(chatId)) {
 			// Strangers get a strict budget and no reply once it runs out: an unanswered bot does not
@@ -1144,6 +1199,13 @@ export class TelegramBridge implements Hub {
 			return;
 		}
 		if (entry && codeMatch && entry.code === codeMatch[1]) {
+			// The code belongs to the person who asked, not to the chat. In a room that is the difference
+			// between pairing the operator and pairing whoever saw the code first.
+			if (entry.userId !== undefined && message.from?.id !== undefined && message.from.id !== entry.userId) {
+				await this.sendHtml(chatId, L("⛔ <i>코드를 요청한 텔레그램 계정이 직접 입력해야 해요. pi에서 <code>/telegram-pair</code>로 승인할 수도 있어요.</i>", "⛔ <i>the Telegram account that asked for the code has to type it. The operator can also approve with <code>/telegram-pair</code> in pi.</i>"));
+				this.notifyUi(this.eventCtx, `telegram: pairing code for ${label} (${chatId}) typed by a different account — not paired`, "warning");
+				return;
+			}
 			this.approvePending(entry);
 			await this.sendHtml(chatId, L("✅ paired! 텍스트는 pi 프롬프트로 바로 전달됩니다.\n/help 로 명령어를 볼 수 있어요.", "✅ paired! Your text goes straight to pi now.\n/help lists the commands."));
 			this.notifyUi(this.eventCtx, `telegram paired: ${label} (${chatId})`, "info");
@@ -1180,12 +1242,12 @@ export class TelegramBridge implements Hub {
 
 	private approvePending(entry: PendingChat): void {
 		this.pending.delete(entry.chatId);
-		this.addChat(entry.chatId, entry.label);
+		this.addChat(entry.chatId, entry.label, this.chatKind(entry.chatId), entry.userId);
 	}
 
-	private addChat(chatId: number, label: string): void {
+	private addChat(chatId: number, label: string, type?: "private" | "group" | "supergroup" | "channel", ownerUserId?: number): void {
 		if (this.cfg.chats.some((chat) => chat.chatId === chatId)) return;
-		const record: TelegramChatRecord = { chatId, label, addedAt: Date.now(), tgLang: this.seenLang.get(chatId) };
+		const record: TelegramChatRecord = { chatId, label, addedAt: Date.now(), tgLang: this.seenLang.get(chatId), type, ownerUserId };
 		this.cfg.chats.push(record);
 		writeConfigNow(this.cfg);
 	}
@@ -1196,11 +1258,11 @@ export class TelegramBridge implements Hub {
 	}
 
 	private async deliverToPi(chatId: number, message: TgMessage, text: string): Promise<void> {
-		const images = await this.collectAttachments(chatId, message);
+		const { images, texts } = await this.collectAttachments(chatId, message);
 		const quoted = message.reply_to_message
 			? `[replying to: ${truncate((message.reply_to_message.text ?? message.reply_to_message.caption ?? "(non-text message)").replace(/\s+/g, " "), 400)}]\n`
 			: "";
-		const body = `${quoted}${text}`.trim();
+		const body = [quoted + text.trim(), ...texts].filter((part) => part.trim()).join("\n\n").trim();
 		if (!body && !images.length) {
 			await this.sendHtml(
 				chatId,
@@ -1357,10 +1419,11 @@ export class TelegramBridge implements Hub {
 		);
 	}
 
-	private async collectAttachments(chatId: number, message: TgMessage): Promise<ImagePart[]> {
-		if (!this.bot) return [];
+	private async collectAttachments(chatId: number, message: TgMessage): Promise<{ images: ImagePart[]; texts: string[] }> {
+		if (!this.bot) return { images: [], texts: [] };
 		this.dbg("attachments", chatId, "photo:", message.photo?.length ?? 0, "doc:", message.document?.file_name ?? "-", "voice:", message.voice ? 1 : 0);
 		const images: ImagePart[] = [];
+		const texts: string[] = [];
 		const notes: Localized[] = [];
 		const photo = message.photo?.length ? message.photo[message.photo.length - 1] : undefined;
 		if (photo) {
@@ -1390,7 +1453,9 @@ export class TelegramBridge implements Hub {
 					this.dbg("document inlined", document.file_name, raw.byteLength, "bytes");
 					const name = safeFileName(document.file_name ?? "attachment");
 					const body = Buffer.from(raw).toString("utf8");
-					this.pi.sendUserMessage([{ type: "text", text: `Attached file from Telegram: ${name}\n\n\`\`\`\n${truncate(body, 24_000)}\n\`\`\`` }]);
+					// Hand the body back rather than sending it: a caption plus an attachment is one thing
+					// the person said, and pi should hear it as one prompt, not two turns.
+					texts.push(`Attached file from Telegram: ${name}\n\n\`\`\`\n${truncate(body, 24_000)}\n\`\`\``);
 				} catch (error) {
 					notes.push((lang) => `${pick(lang, "파일 읽기 실패", "file read failed")}: ${errorMessage(error)}`);
 				}
@@ -1405,7 +1470,7 @@ export class TelegramBridge implements Hub {
 		if (message.video || message.animation || message.video_note) notes.push((lang) => pick(lang, "동영상은 pi로 넘기지 않아요", "video is not forwarded to pi"));
 		if (message.sticker) notes.push((lang) => `${pick(lang, "스티커", "sticker")} ${message.sticker?.emoji ?? ""}`.trim());
 		if (notes.length) await this.sendHtml(chatId, (lang) => `ℹ️ ${escapeHtml(notes.map((note) => (typeof note === "string" ? note : note(lang))).join(" · "))}`).catch(() => undefined);
-		return images;
+		return { images, texts };
 	}
 
 	private async download(fileId: string): Promise<Uint8Array> {
@@ -2003,7 +2068,9 @@ export class TelegramBridge implements Hub {
 	}
 
 	chats(): number[] {
-		return this.cfg.chats.map((chat) => chat.chatId);
+		// A group that was paired while groups were allowed stops receiving anything the moment they
+		// are not: the transcript must not leak into a room the operator no longer trusts.
+		return this.cfg.chats.filter((chat) => chat.type === undefined || chat.type === "private" || this.cfg.allowGroups).map((chat) => chat.chatId);
 	}
 
 	isPaired(chatId: number): boolean {

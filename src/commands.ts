@@ -7,7 +7,7 @@
  * template commands are passed straight through with `expandPromptTemplates`.
  */
 import type { CallbackActionKind, CallbackEntry, CallbackResult, Hub, ListSpec, SendOptions } from "./hub.ts";
-import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, tgDebug, truncate } from "./format.ts";
+import { credentialHits, escapeHtml, formatBytes, formatCount, formatDuration, inlineCode, redactSecrets, scrubKnownSecrets, tgDebug, truncate } from "./format.ts";
 import { goalCardHtml, goalStatusLabel } from "./goal.ts";
 import { L, pick, render } from "./i18n.ts";
 import type { Lang, Localized } from "./i18n.ts";
@@ -433,12 +433,69 @@ ${joinLines(notes)(lang)}`,
 		await this.say(chatId, (lang) => (mode === "steer" ? pick(lang, "🧭 steer로 큐에 넣었어요.", "🧭 queued as a steer.") : pick(lang, "📮 follow-up으로 큐에 넣었어요.", "📮 queued as a follow-up.")));
 	}
 
+	/**
+	 * What is worth a second look before running: recursive deletes, disk tools, shutdowns, force
+	 * pushes, table drops, `curl | sh`, fork bombs. Deliberately blunt — a false positive costs one
+	 * tap; a false negative can cost a machine.
+	 */
+	private static readonly RISKY: { re: RegExp; why: string }[] = [
+		{ re: /\brm\s+-[a-z]*[rf][a-z]*\b/i, why: "recursive or forced delete" },
+		{ re: /\b(sudo|doas)\b[^\n]*\brm\b/i, why: "delete as root" },
+		{ re: /\b(del|rd|erase)\s+\/[sq]\b/i, why: "Windows recursive delete" },
+		{ re: /\bRemove-Item\b[^\n]*-(Recurse|Force)/i, why: "PowerShell recursive delete" },
+		{ re: /\bformat(\.com)?\s+[a-z]:|\bmkfs\b|\bdiskpart\b|\bdd\b[^\n]*\bof=\/dev\//i, why: "disk formatting" },
+		{ re: />\s*\/dev\/(sd|nvme|hd)/i, why: "writing over a disk" },
+		{ re: /\b(shutdown|reboot|poweroff)\b|\btaskkill\b\s+\/|\breg\s+delete\b|\bvssadmin\s+delete|\bcipher\s+\/w/i, why: "system or recovery damage" },
+		{ re: /\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba|z)?sh\b/i, why: "piping a download into a shell" },
+		{ re: /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, why: "fork bomb" },
+		{ re: /\bgit\s+push\b[^\n]*(--force\b|\s-f\b)/i, why: "force push" },
+		{ re: /\b(DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE)\b/i, why: "destroying data" },
+		{ re: /\b(chmod|chown)\s+-R\b[^\n]*\s\/(\s|$)/i, why: "permissions over the whole filesystem" },
+	];
+
+	private riskyReason(command: string): string | undefined {
+		for (const entry of CommandLayer.RISKY) if (entry.re.test(command)) return entry.why;
+		return undefined;
+	}
+
 	private async bash(chatId: number, args: string): Promise<void> {
 		const command = args.trim();
 		if (!command) {
 			await this.say(chatId, (lang) => `${pick(lang, "사용법", "usage")}: ${inlineCode("/bash <command>")}`);
 			return;
 		}
+		if (!this.hub.cfg.allowShell) {
+			await this.say(
+				chatId,
+				(lang) =>
+					`🔒 ${pick(lang, "이 브리지는 명령 실행이 꺼져 있어요.", "this bridge has command execution switched off.")} ${pick(lang, "pi에서 <code>telegram.json</code>의 <code>allowShell</code>을 켜면 쓸 수 있어요.", "Turn <code>allowShell</code> on in <code>telegram.json</code> in pi to use it.")}`,
+			);
+			return;
+		}
+		const why = this.riskyReason(command);
+		if (why) {
+			// One tap to confirm, and the token is bound to this chat: nobody else in the world can
+			// approve the command, and the tap cannot be replayed somewhere else.
+			const keyboard: TgInlineKeyboardButton[][] = [
+				[
+					{ text: pick(this.hub.lang(chatId), "✅ 실행", "✅ run it"), callback_data: this.hub.createToken({ kind: "shell:confirm", value: command }, chatId) },
+					{ text: pick(this.hub.lang(chatId), "❌ 취소", "❌ cancel"), callback_data: this.hub.createToken({ kind: "shell:cancel" }, chatId) },
+				],
+			];
+			await this.say(
+				chatId,
+				(lang) =>
+					`⚠️ <b>${pick(lang, "확인 필요", "confirmation needed")}</b> · ${escapeHtml(why)}\n${inlineCode(truncate(command, 300))}\n${pick(lang, "되돌리기 어려울 수 있는 명령이에요. 여기서 확인해야 실행됩니다.", "this may be hard to undo. It runs only after you confirm here.")}`,
+				{ keyboard },
+			);
+			this.hub.notify(`⚠️ telegram asked for a possibly destructive command (${why}): ${truncate(command, 200)} — waiting for confirmation on the phone`, "warning");
+			return;
+		}
+		await this.runBash(chatId, command);
+	}
+
+	private async runBash(chatId: number, command: string): Promise<void> {
+		await this.say(chatId, `💻 ${inlineCode(truncate(command, 200))}`);
 		await this.say(chatId, `💻 ${inlineCode(truncate(command, 200))}`);
 		const result = await this.hub.runShell(command, 120_000);
 		let body = [result.stdout, result.stderr].filter(Boolean).join("\n").replace(/\s+$/g, "");
@@ -468,11 +525,22 @@ ${joinLines(notes)(lang)}`,
 		}
 		try {
 			const { readFileSync } = await import("node:fs");
-			const data = Uint8Array.from(readFileSync(path));
+			const raw = Buffer.from(readFileSync(path));
 			const name = path.split(/[\\/]/).pop() ?? "session.jsonl";
-			// The transcript is a second copy of everything pi handled, tool output included.
+			// The transcript is a second copy of everything pi handled, tool output included — and it is
+			// about to sit on a phone, in a company app, on a device that can be lost. Mask by default.
+			let data: Uint8Array = raw;
+			let masked = false;
+			if (this.hub.cfg.redactOnExport) {
+				const scrubbed = scrubKnownSecrets(redactSecrets(raw.toString("utf8")));
+				if (scrubbed !== raw.toString("utf8")) {
+					masked = true;
+					data = Buffer.from(scrubbed, "utf8");
+				}
+			}
 			const hits = credentialHits(Buffer.from(data).toString("utf8"));
-			const caption: Localized = (lang) => `📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}${hits ? ` · ⚠️ ${pick(lang, "credential처럼 보이는 문자열", "strings that look like credentials")} ${hits}` : ""}`;
+			const caption: Localized = (lang) =>
+				`📦 ${escapeHtml(this.hub.sessionName() ?? this.hub.sessionInfo().id)} · ${formatBytes(data.byteLength)}${masked ? ` · 🔏 ${pick(lang, "비밀번호·토큰 모양은 가렸어요", "credential-looking strings masked")}` : ` · ${pick(lang, "원본 그대로", "sent unmasked")}`}${hits ? ` · ⚠️ ${pick(lang, "남은 credential 모양", "remaining credential-looking strings")} ${hits}` : ""}`;
 			await this.hub.sendFile(chatId, data, name, caption);
 		} catch (error) {
 			await this.say(chatId, (lang) => `⚠️ export ${pick(lang, "실패", "failed")}: ${escapeHtml(safeError(error))}`);
@@ -1040,6 +1108,16 @@ ${joinLines(notes)(lang)}`,
 				await this.handle({ chatId, userId: 0, command: command.toLowerCase(), args: rest.join(" "), raw: value });
 				return { toast: command };
 			}
+			case "shell:confirm": {
+				const command = action.value ?? "";
+				if (!command) return { toast: pick(this.hub.lang(chatId), "명령이 없어요", "no command"), showAlert: true };
+				// The switch may have been turned off between the question and the tap.
+				if (!this.hub.cfg.allowShell) return { toast: pick(this.hub.lang(chatId), "명령 실행이 꺼져 있어요", "command execution is off"), showAlert: true };
+				await this.runBash(chatId, command);
+				return { toast: pick(this.hub.lang(chatId), "실행했어요", "ran it") };
+			}
+			case "shell:cancel":
+				return { toast: pick(this.hub.lang(chatId), "취소했어요", "cancelled") };
 			case "chat:unpair": {
 				const target = Number(action.value ?? "");
 				if (!Number.isFinite(target)) return { toast: pick(this.hub.lang(chatId), "잘못된 채팅 id", "bad chat id"), showAlert: true };
